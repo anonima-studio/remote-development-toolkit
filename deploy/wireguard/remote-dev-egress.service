@@ -1,0 +1,14 @@
+[Unit]
+Description=Remote Dev workspace networks and egress
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+Before=remote-dev-coder-coder-1.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/remote-dev-egress-up
+ExecStop=/usr/local/sbin/remote-dev-egress-down
+
+[Install]
+WantedBy=multi-user.target

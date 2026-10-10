@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Development"
+  short_description: "Standardize per-project Coder workspaces"
+  default_prompt: "Use $remote-development to configure this project for standardized remote development in Coder."

@@ -1,0 +1,8 @@
+tunnel: {{TUNNEL_ID}}
+credentials-file: /etc/cloudflared/{{TUNNEL_ID}}.json
+no-autoupdate: true
+
+ingress:
+  - hostname: {{HOSTNAME}}
+    service: http://127.0.0.1:{{CODER_HOST_PORT}}
+  - service: http_status:404

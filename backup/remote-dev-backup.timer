@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Remote Dev backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=remote-dev-backup.service
+
+[Install]
+WantedBy=timers.target

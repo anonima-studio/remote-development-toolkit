@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""Plan explicit transfers between remote and local-agent source authorities."""
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+sys.dont_write_bytecode = True
+
+REPOSITORY = Path(__file__).resolve().parent.parent
+TRANSFER_PATH = REPOSITORY / "bin/remote-dev-git-transfer.py"
+CONTRACT_PATH = REPOSITORY / "templates/docker/project-contract.py"
+ENDPOINT_PATH = REPOSITORY / "bin/remote-dev-mode-endpoint.py"
+OPERATION_PATH = REPOSITORY / "bin/remote-dev-mode-operation.py"
+
+
+def module_from_file(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+TRANSFER = module_from_file("remote_dev_transfer", TRANSFER_PATH)
+CONTRACT = module_from_file("remote_dev_contract", CONTRACT_PATH)
+ENDPOINT = module_from_file("remote_dev_endpoint", ENDPOINT_PATH)
+ENDPOINT.TRANSFER, ENDPOINT.CONTRACT = TRANSFER, CONTRACT
+WORKSPACE = module_from_file("remote_dev_workspace_plan", REPOSITORY / "bin/remote-dev-workspace-plan.py")
+
+
+class ModeError(Exception):
+    pass
+
+
+def encode(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def checksum(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def identifier(value, label):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,100}", value or ""):
+        raise ModeError(f"INVALID_IDENTITY: invalid {label}")
+    return value
+
+
+def canonical(value):
+    path = Path(value).expanduser()
+    if not path.is_absolute() or path.resolve() != path or any(part.casefold() == ".git" for part in path.parts):
+        raise ModeError("INVALID_PATH: an absolute canonical path is required")
+    return str(path)
+
+
+class Store:
+    """Operator-owned review plans and journals; status never creates storage."""
+
+    def __init__(self):
+        default = Path.home() / ".local/share/remote-dev/mode"
+        self.root = Path(os.environ.get("REMOTE_DEV_MODE_STATE_ROOT", default)).absolute()
+        if self.root.resolve() != self.root:
+            raise ModeError("STATE_UNTRUSTED: state root has a symbolic-link ancestor")
+
+    def read(self, group, key):
+        identifier(key, "state key")
+        file = self.root / group / (key + ".json")
+        if file.parent.resolve() != file.parent:
+            raise ModeError("STATE_UNTRUSTED: state group has a symbolic-link ancestor")
+        if not file.exists():
+            return None
+        if file.is_symlink() or not file.is_file() or file.stat().st_uid != os.getuid() or file.stat().st_mode & 0o077:
+            raise ModeError("STATE_UNTRUSTED: state record is not an owner-only regular file")
+        return ENDPOINT.read_record(file)
+
+    def create(self, group, key, value):
+        identifier(key, "state key")
+        parent = self.root / group
+        parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if parent.resolve() != parent or parent.stat().st_uid != os.getuid():
+            raise ModeError("STATE_UNTRUSTED: state directory identity differs")
+        self.root.chmod(0o700)
+        parent.chmod(0o700)
+        path = parent / (key + ".json")
+        if path.exists() or path.is_symlink():
+            if self.read(group, key) == value:
+                return str(path)
+            raise ModeError("STATE_CONFLICT: immutable state ID already exists")
+        ENDPOINT.write_record(path, value, exclusive=True)
+        return str(path)
+
+    def for_context(self, context):
+        context = Path(canonical(context))
+        directory = self.root / "projects"
+        if not directory.exists():
+            return None
+        if directory.is_symlink():
+            raise ModeError("STATE_UNTRUSTED: projects directory is a symbolic link")
+        matches = []
+        for path in directory.glob("*.json"):
+            item = self.read("projects", path.stem)
+            if context == Path(item["local_root"]) or Path(item["local_root"]) in context.parents:
+                matches.append(item)
+        if len(matches) > 1:
+            raise ModeError("AMBIGUOUS_CONTEXT: more than one project claims the local context")
+        return matches[0] if matches else None
+
+    def superseded_owner(self, context):
+        """Identify the project that replaced this Mac root through an adoption.
+
+        A superseded root keeps its inactive authority fence, so it must stay
+        recognizable: an operator arriving at the old duplicate is told where
+        the current source authority lives instead of seeing an unbound path.
+        """
+        context = Path(canonical(context))
+        directory = self.root / "projects"
+        if not directory.exists() or directory.is_symlink():
+            return None
+        for path in directory.glob("*.json"):
+            item = self.read("projects", path.stem)
+            for root in item.get("superseded_local_roots", []):
+                if context == Path(root) or Path(root) in context.parents:
+                    return item
+        return None
+
+    def write(self, group, key, value):
+        identifier(key, "state key")
+        ENDPOINT.private_directory(self.root)
+        ENDPOINT.write_record(self.root / group / (key + ".json"), value)
+
+    @contextlib.contextmanager
+    def mutex(self, project_id):
+        identifier(project_id, "project ID")
+        ENDPOINT.private_directory(self.root)
+        parent = self.root / "locks"
+        ENDPOINT.private_directory(parent)
+        fd = os.open(parent / project_id, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            if os.fstat(fd).st_uid != os.getuid() or os.fstat(fd).st_mode & 0o077:
+                raise ModeError("STATE_UNTRUSTED: project mutex permissions differ")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ModeError("OPERATION_BUSY: another process is operating this project")
+            yield
+        finally:
+            os.close(fd)
+
+
+def inspect_checkout(root, role, allowed, expected_features=None):
+    """Runs on the endpoint, with no writes or workspace autostart."""
+    root = Path(root).expanduser()
+    if not root.is_absolute() or root.resolve() != root:
+        raise ModeError("INVALID_PATH: endpoint root must be canonical")
+    if role:
+        projects = (Path.home() / "projects").resolve()
+        if projects not in root.parents:
+            raise ModeError("INVALID_PATH: remote endpoint must be below ~/projects")
+        marker = Path.home() / ".local/share/remote-dev/workspace-role"
+        if marker.is_symlink() or not marker.is_file():
+            raise ModeError("WORKSPACE_ROLE_INVALID: immutable role marker is absent or unsafe")
+        if marker.read_text() != role + "\n":
+            raise ModeError("WORKSPACE_ROLE_MISMATCH: endpoint role differs")
+    existing_parent = root.parent
+    while not existing_parent.exists():
+        existing_parent = existing_parent.parent
+    result = {"root": str(root), "role": role, "exists": root.exists(),
+              "free_bytes": shutil.disk_usage(existing_parent).free,
+              "tree": ENDPOINT.tree_fingerprint(root)}
+    if role and expected_features is not None:
+        result["image_features"] = {}
+        for name, expected in expected_features.items():
+            installed = Path("/usr/local/bin") / name
+            actual = hashlib.sha256(installed.read_bytes()).hexdigest() if installed.is_file() and not installed.is_symlink() else None
+            result["image_features"][name] = {"sha256": actual, "expected": expected, "matches": actual == expected}
+        try:
+            docker = subprocess.run(["docker", "info", "--format", "{{.Driver}}"], capture_output=True, timeout=10)
+            result["docker_ready"] = docker.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            result["docker_ready"] = False
+    if not root.exists():
+        return result
+    if not root.is_dir():
+        raise ModeError("TARGET_OCCUPIED: endpoint path is not a directory")
+    if role == "runner":
+        if (root / ".git").exists() or (root / ".git").is_symlink():
+            raise ModeError("RUNNER_NOT_GITLESS: runner destination contains Git metadata")
+        result["empty"] = not any(root.iterdir())
+        return result
+    if not any(root.iterdir()):
+        result["empty"] = True
+        return result
+    result["snapshot"] = TRANSFER.inspect(root, allowed)
+    result["source_bytes"] = sum(entry.get("size", 0) for entry in result["snapshot"]["worktree"])
+    # The complete object directory bounds transferable Git storage without
+    # creating a bundle during plan. Runtime data stays outside that budget.
+    result["git_storage_bytes"] = sum(path.stat().st_size for path in (root / ".git/objects").rglob("*") if path.is_file())
+    result["untracked_inventory"] = TRANSFER.nul_paths(TRANSFER.git(root, "ls-files", "--others", "--exclude-standard", "-z"))
+    # Names only, never contents: publication renames the whole checkout away,
+    # so an adopted destination must be able to enumerate its ignored data.
+    result["ignored_inventory"] = TRANSFER.nul_paths(
+        TRANSFER.git(root, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"))
+    try:
+        result["contract"] = CONTRACT.read_contract(root, switching=True)
+    except CONTRACT.ContractError as error:
+        result["contract_error"] = str(error)
+    return result
+
+
+class Endpoint:
+    def __init__(self, profile=None, origin=None, workspace=None, role=None):
+        self.profile, self.origin, self.workspace, self.role = profile, origin, workspace, role
+        if workspace:
+            identifier(workspace, "workspace")
+            identifier(profile, "profile")
+            # HTTPS for a published Coder, or the Mac end of an SSH forward.
+            if not origin or not re.fullmatch(r"(https://[A-Za-z0-9.-]+(?::[0-9]+)?|http://127\.0\.0\.1:[0-9]+)/?", origin):
+                raise ModeError("INVALID_IDENTITY: an explicit HTTPS or SSH-forward Coder origin is required")
+            config_root = Path(os.environ.get("REMOTE_DEV_CODEX_DESKTOP_CONFIG_ROOT",
+                                             str(Path.home() / "Library/Application Support/remote-dev/coder")))
+            self.coder = ["coder", "--no-version-warning", "--global-config", str(config_root / profile), "--url", origin]
+
+    def inspect(self, root, allowed=()):
+        if not self.workspace:
+            return inspect_checkout(root, None, allowed)
+        # Transmit the exact current readers in-memory; inspection installs no files.
+        bootstrap = "import types, json, sys, os, shutil, hashlib, subprocess\nfrom pathlib import Path\n"
+        bootstrap += "TRANSFER=types.ModuleType('transfer')\nexec(" + repr(TRANSFER_PATH.read_text()) + ",TRANSFER.__dict__)\n"
+        bootstrap += "CONTRACT=types.ModuleType('contract')\nexec(" + repr(CONTRACT_PATH.read_text()) + ",CONTRACT.__dict__)\n"
+        bootstrap += "ENDPOINT=types.ModuleType('endpoint')\nexec(" + repr(ENDPOINT_PATH.read_text()) + ",ENDPOINT.__dict__)\n"
+        import inspect
+        bootstrap += "class ModeError(Exception): pass\n" + inspect.getsource(inspect_checkout)
+        bootstrap += "\ntry:\n r=REQUEST; print(json.dumps(inspect_checkout(r['root'],r['role'],r['allowed'],r['features'])))\n"
+        bootstrap += "except Exception as e:\n print(str(e) if isinstance(e,(ModeError,TRANSFER.TransferError,CONTRACT.ContractError)) else type(e).__name__,file=sys.stderr);sys.exit(1)\n"
+        command = self.coder + ["ssh", "--disable-autostart", "--wait=no", self.workspace, "--",
+                                shlex.join(["python3", "-c", "import json,sys; e=json.load(sys.stdin); exec(e['code'],{'REQUEST':e['request']})"])]
+        try:
+            features = {name: checksum((REPOSITORY / "templates/docker" / filename).read_bytes()) for name, filename in
+                        (("remote-dev-mode-guard", "mode-guard.py"), ("remote-dev-project-contract", "project-contract.py"),
+                         ("remote-dev-codex", "codex-start.sh"), ("remote-dev-project-setup", "project-setup.sh"))}
+            result = subprocess.run(command, input=encode({"code": bootstrap, "request": {"root": root, "role": self.role, "allowed": list(allowed), "features": features}}),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+        except subprocess.TimeoutExpired as error:
+            raise ModeError("RUNNER_UNREACHABLE: endpoint inspection timed out; preserve its current state") from error
+        if result.returncode:
+            diagnostics = result.stderr.decode(errors="replace")
+            refusal = re.search(r"(?:^|\n)([A-Z][A-Z_]+):", diagnostics)
+            if refusal:
+                raise ModeError(refusal.group(1) + ": remote inspection refused; preserve the workspace and resolve the reported source prerequisite")
+            for code in ("WORKSPACE_ROLE_INVALID", "WORKSPACE_ROLE_MISMATCH", "UNSUPPORTED_GIT_STATE", "SECRET_PATH", "PATH_COLLISION", "RUNNER_NOT_GITLESS"):
+                if code + ":" in diagnostics:
+                    raise ModeError(code + ": remote inspection refused; preserve the workspace and inspect its project contract")
+            status = subprocess.run(self.coder + ["list", "--search", "owner:me name:" + self.workspace, "--output", "json"],
+                                    capture_output=True, timeout=20)
+            try:
+                matches = [row for row in json.loads(status.stdout) if row.get("name") == self.workspace]
+            except (ValueError, TypeError):
+                matches = []
+            if len(matches) == 1 and matches[0].get("latest_build", {}).get("status") == "stopped":
+                raise ModeError("WORKSPACE_STOPPED: start the explicitly selected workspace before applying a new plan")
+            raise ModeError("RUNNER_UNREACHABLE: no verified endpoint response; status did not autostart it")
+        return json.loads(result.stdout)
+
+    def request(self, action, payload, input_path=None, output_path=None):
+        request = {**payload, "role": self.role}
+        if not self.workspace:
+            with contextlib.ExitStack() as stack:
+                source = stack.enter_context(open(input_path, "rb")) if input_path else None
+                destination = stack.enter_context(open(output_path, "xb")) if output_path else None
+                return ENDPOINT.Transaction(request).handle(action, source, destination)
+        bootstrap = "import types,json,sys\ne=json.loads(sys.stdin.buffer.readline())\n"
+        modules = {}
+        for name, path in (("TRANSFER", TRANSFER_PATH), ("CONTRACT", CONTRACT_PATH), ("ENDPOINT", ENDPOINT_PATH)):
+            modules[name] = path.read_text()
+            bootstrap += name + "=types.ModuleType(" + repr(name.lower()) + ")\nexec(e['modules'][" + repr(name) + "]," + name + ".__dict__)\n"
+        bootstrap += "ENDPOINT.TRANSFER=TRANSFER;ENDPOINT.CONTRACT=CONTRACT\n"
+        bootstrap += "try:\n result=ENDPOINT.Transaction(e['request']).handle(e['action'],sys.stdin.buffer,sys.stdout.buffer)\n"
+        bootstrap += " if result is not None: print(json.dumps(result))\n"
+        bootstrap += "except Exception as error:\n print(str(error) if isinstance(error,(ENDPOINT.EndpointError,TRANSFER.TransferError,CONTRACT.ContractError)) else type(error).__name__,file=sys.stderr);sys.exit(1)\n"
+        command = self.coder + ["ssh", "--disable-autostart", "--wait=no", self.workspace, "--", shlex.join(["python3", "-c", bootstrap])]
+        environment = os.environ.copy()
+        timeout = payload.get("lifecycle_timeout", 300) + 120 if action == "lifecycle" else 420
+        if self.role == "runner" and action == "lifecycle" and payload.get("lifecycle_phase") != "status" and getattr(self, "local_context", None):
+            command = [str(REPOSITORY / "bin/remote-dev-local-agent"), "--profile", self.profile, "--coder-url", self.origin,
+                       "exec", "--for-context", self.local_context, "--timeout-seconds", str(timeout - 60), "--", "python3", "-c", bootstrap]
+            environment.update(REMOTE_DEV_MODE_OPERATION_ID=payload["operation_id"], REMOTE_DEV_MODE_TOKEN=payload["token"])
+        with contextlib.ExitStack() as stack:
+            # Keep code and arbitrarily large Git inventories off SSH argv.
+            # The single JSON line precedes a streamed binary upload, if any.
+            source = stack.enter_context(tempfile.TemporaryFile())
+            source.write(encode({"modules": modules, "request": request, "action": action}) + b"\n")
+            if input_path:
+                with open(input_path, "rb") as payload_file:
+                    shutil.copyfileobj(payload_file, source)
+            source.seek(0)
+            destination = stack.enter_context(open(output_path, "xb")) if output_path else subprocess.PIPE
+            try:
+                result = subprocess.run(command, stdin=source, stdout=destination, stderr=subprocess.PIPE, env=environment, timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                raise ModeError("RECOVERY_REQUIRED: endpoint outcome is unknown after transport timeout; retain claims and resume with the same operation") from error
+        if result.returncode:
+            diagnostic = result.stderr.decode(errors="replace")
+            code = re.search(r"(?:^|\n)([A-Z][A-Z_]+):", diagnostic)
+            raise ModeError((code.group(1) if code else "RECOVERY_REQUIRED") + ": endpoint refused " + action + "; preserve its state and resume or inspect the same operation")
+        return None if output_path else json.loads(result.stdout)
+
+
+def toolkit_id():
+    dependencies = (Path(__file__), TRANSFER_PATH, CONTRACT_PATH, ENDPOINT_PATH, OPERATION_PATH,
+                    REPOSITORY / "bin/remote-dev-local-agent", REPOSITORY / "bin/remote-dev-tracked-inventory.py",
+                    REPOSITORY / "bin/remote-dev-local-agent-working-set.py",
+                    REPOSITORY / "templates/docker/mode-guard.py", REPOSITORY / "bin/remote-dev-secrets",
+                    REPOSITORY / "bin/remote-dev-secret-upload.py", REPOSITORY / "bin/remote-dev-secret-read.py",
+                    REPOSITORY / "bin/remote-dev-secret-runner-upload.py",
+                    REPOSITORY / "bin/remote-dev-workspace", REPOSITORY / "bin/remote-dev-workspace-plan.py",
+                    REPOSITORY / "deploy/workspace-capacity.py", REPOSITORY / "deploy/workspace-images.py",
+                    REPOSITORY / "templates/docker/main.tf", REPOSITORY / "bin/remote-dev")
+    return checksum(b"".join(path.read_bytes() for path in dependencies))
+
+
+def secrets_route(path, project, target_mode, runtime_root, source_runtime_root=None):
+    """Freeze routing metadata only; the existing secrets owner validates files."""
+    path = Path(canonical(path))
+    info = path.stat()
+    if not path.is_file() or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 65536:
+        raise ModeError("SECRETS_MANIFEST_UNTRUSTED: use an owner-only regular routing manifest")
+    content = path.read_bytes()
+    fields, files = {}, []
+    for line in content.decode().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if parts[0] == "file" and len(parts) == 3:
+            for value in parts[1:]:
+                if not value or value.startswith("/") or any(part in ("", ".", "..") for part in value.split("/")) or any(ord(c) < 32 for c in value):
+                    raise ModeError("SECRETS_ROUTE_INVALID: unsafe file route")
+            files.append(parts[1:])
+        elif len(parts) == 2 and parts[0] in {"manifest_version", "project_id", "workspace", "workspace_role", "local_root", "remote_root", "source_workspace", "source_workspace_role", "source_root", "source_context"} and parts[0] not in fields:
+            fields[parts[0]] = parts[1]
+        else:
+            raise ModeError("SECRETS_ROUTE_INVALID: unsupported or duplicate manifest directive")
+    expected = {"manifest_version": "2", "project_id": project["project_id"],
+                "workspace": project["runner_workspace"] if target_mode == "local-agent" else project["development_workspace"],
+                "workspace_role": "runner" if target_mode == "local-agent" else "development",
+                "local_root": project["local_root"], "remote_root": runtime_root}
+    if fields.get("manifest_version") == "3":
+        source_root = fields.get("source_root", "")
+        if (not source_root.startswith("/home/coder") or
+                source_root != "/home/coder" and not source_root.startswith("/home/coder/") or
+                any(part in ("", ".", "..") for part in source_root.split("/")[1:]) or
+                "\\" in source_root or any(ord(c) < 32 for c in source_root)):
+            raise ModeError("SECRETS_ROUTE_INVALID: require a canonical source root within /home/coder")
+        expected.update(manifest_version="3", source_root=source_root,
+                        source_workspace=project["development_workspace"] if target_mode == "local-agent" else project["runner_workspace"],
+                        source_workspace_role="development" if target_mode == "local-agent" else "runner",
+                        source_context=source_runtime_root or project["remote_root"])
+        if expected["source_workspace"] == expected["workspace"]:
+            raise ModeError("SECRETS_ROUTE_INVALID: source and target workspaces must differ")
+    if fields != expected or not files:
+        raise ModeError("SECRETS_ROUTE_MISMATCH: manifest must address the exact final project and runtime endpoints")
+    return {"path": str(path), "sha256": checksum(content), "identity": fields, "files": files}
+
+
+# Destination-only state that publication drops, with the option that accepts it.
+ADOPTION_LOSS = (("untracked", "--accept-untracked-loss"), ("ignored", "--accept-ignored-loss"),
+                 ("refs", "--accept-ref-loss"))
+
+
+def operation_module():
+    """Load the operation module bound to this module's namespace."""
+    module = module_from_file("remote_dev_operation", OPERATION_PATH)
+    module.MODE = sys.modules[__name__]
+    return module
+
+
+def remote_identity(url):
+    """Identify the repository a remote points at, not the transport used.
+
+    `git@host:owner/repo.git` and `https://host/owner/repo` are the same
+    repository. Refusing over that difference would be a false negative on an
+    ordinary checkout that simply fetches over a different protocol.
+    """
+    if not url:
+        return None
+    value = url.strip().rstrip("/")
+    if "://" in value:
+        parsed = urlsplit(value)
+        host, path = parsed.hostname or "", parsed.path
+    else:
+        scp = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", value)
+        if not scp:
+            return value
+        host, path = scp.group(1), scp.group(2)
+    path = path.lstrip("/")
+    return host.lower() + "/" + (path[:-4] if path.endswith(".git") else path)
+
+
+def config_value(snapshot, name):
+    for key, value in snapshot["config"]:
+        if key == name:
+            return value
+    return None
+
+
+def adoption_review(source, target, accepted):
+    """Prove an existing destination already holds this project, and name the loss.
+
+    Publication renames the whole destination away and puts a reconstruction of
+    the source at that path, so presence has never been authority. A departure
+    receipt proves the path is untouched managed residue. Adoption proves the
+    same absence of unique state differently: every captured path already equals
+    the source byte for byte, and everything else the rename would drop is
+    enumerated and explicitly accepted. Nothing is waived silently.
+    """
+    if "snapshot" not in target:
+        return ["ADOPT_TARGET_UNSUPPORTED: the existing destination is not a supported Git checkout"], {}
+    before, after = source["snapshot"], target["snapshot"]
+    blockers = []
+    if before["object_format"] != after["object_format"]:
+        blockers.append("ADOPT_REPOSITORY_MISMATCH: destination uses a different Git object format")
+    if remote_identity(config_value(before, "remote.origin.url")) != remote_identity(config_value(after, "remote.origin.url")):
+        blockers.append("ADOPT_REPOSITORY_MISMATCH: destination origin differs from the source origin")
+    if before["head"] != after["head"]:
+        blockers.append("ADOPT_REPOSITORY_MISMATCH: destination HEAD differs from the source commit")
+    if before["index"] != after["index"]:
+        blockers.append("ADOPT_INDEX_DIVERGED: destination index differs from the source index")
+    if (before["staged_raw_sha256"], before["unstaged_raw_sha256"]) != (after["staged_raw_sha256"], after["unstaged_raw_sha256"]):
+        blockers.append("ADOPT_WORKTREE_DIVERGED: destination holds uncommitted work that the source does not")
+    captured = {entry["path"] for entry in before["index"]} | set(before["selected_untracked"])
+    present = {entry["path"]: entry for entry in after["worktree"]}
+    differing = [entry["path"] for entry in before["worktree"]
+                 if entry["path"] in captured and present.get(entry["path"]) != entry]
+    if differing:
+        blockers.append("ADOPT_WORKTREE_DIVERGED: " + str(len(differing)) +
+                        " captured paths differ between the source and the destination")
+    kept = {(ref["name"], ref["oid"]) for ref in before["refs"]}
+    dropped = {"untracked": sorted(set(target["untracked_inventory"]) - captured),
+               "ignored": sorted(target["ignored_inventory"]),
+               "refs": sorted(ref["name"] for ref in after["refs"]
+                              if ref["name"].startswith(("refs/heads/", "refs/tags/", "refs/stash"))
+                              and (ref["name"], ref["oid"]) not in kept)}
+    for label, flag in ADOPTION_LOSS:
+        if dropped[label] and label not in accepted:
+            blockers.append("ADOPT_" + label.upper() + "_PRESENT: " + str(len(dropped[label])) +
+                            " destination " + label + " entries do not survive publication; "
+                            "review them in the reviewed plan file and pass " + flag)
+    return blockers, dropped
+
+
+def rebind_parity(before, after):
+    """Separate a different repository from a different state of the same one.
+
+    Re-anchoring keeps the runner and its projection, so a different repository
+    is never acceptable, while a different state of the same repository only
+    changes what the runner will execute next and can be reviewed and accepted.
+    """
+    identity, drift = [], []
+    if before["object_format"] != after["object_format"]:
+        identity.append("object format")
+    if remote_identity(config_value(before, "remote.origin.url")) != remote_identity(config_value(after, "remote.origin.url")):
+        identity.append("origin")
+    if before["head"] != after["head"]:
+        drift.append("HEAD")
+    if before["index"] != after["index"]:
+        drift.append("index")
+    if (before["staged_raw_sha256"], before["unstaged_raw_sha256"]) != (after["staged_raw_sha256"], after["unstaged_raw_sha256"]):
+        drift.append("uncommitted work")
+    captured = {entry["path"] for entry in before["index"]} | set(before["selected_untracked"])
+    present = {entry["path"]: entry for entry in after["worktree"]}
+    if any(entry["path"] in captured and present.get(entry["path"]) != entry for entry in before["worktree"]):
+        drift.append("projected file content")
+    return identity, drift
+
+
+def rebind(args, store, operation):
+    """Review a re-anchor of the active Local Agent binding, then run it."""
+    if not getattr(args, "writers_paused", False):
+        raise ModeError("WRITERS_PAUSE_REQUIRED: pause IDEs and agents at both Mac roots, then re-anchor with --writers-paused")
+    # Re-anchoring moves the very path that identifies the project, so a repeat
+    # of the same command -- the documented recovery -- must still resolve from
+    # the context the operator started at.
+    project = store.for_context(args.for_context) or store.superseded_owner(args.for_context)
+    if not project:
+        raise ModeError("UNBOUND_CONTEXT: re-anchoring operates on an existing managed project; "
+                        "a Local Agent working-set binding moves with local-agent reanchor")
+    if project["active_mode"] != "local-agent":
+        raise ModeError("REBIND_MODE_UNSUPPORTED: only an active local-agent binding is re-anchored; "
+                        "enter local-agent onto an existing checkout with mode plan --adopt-target")
+    requested = canonical(args.to_root)
+    if args.confirm_root != requested:
+        raise ModeError("REBIND_CONFIRMATION_REQUIRED: repeat the exact requested Mac root in --confirm-root")
+    if requested == project["local_root"]:
+        pending = store.read("pending", project["project_id"])
+        journal = store.read("operations", pending["operation_id"]) if pending and not pending.get("complete") else None
+        if journal and journal.get("kind") == "rebind" and journal["local_root"] == requested:
+            return operation.execute_rebind(journal, store)
+        raise ModeError("ALREADY_ACTIVE: the requested Mac root is already the source authority")
+    owner = store.for_context(requested) or store.superseded_owner(requested)
+    if owner and owner["project_id"] != project["project_id"]:
+        raise ModeError("PROJECT_ALREADY_BOUND: the requested Mac root belongs to another managed project")
+    if store.root == Path(requested) or Path(requested) in store.root.parents:
+        raise ModeError("STATE_PATH_CONFLICT: mode records must be outside the authoritative project checkout")
+    allowed = project.get("allowed_untracked", [])
+    current = Endpoint().inspect(project["local_root"], allowed)
+    target = Endpoint().inspect(requested, allowed)
+    if "snapshot" not in current or "snapshot" not in target:
+        raise ModeError("REBIND_ROOT_UNSUPPORTED: both the current and the requested root must be supported Git checkouts")
+    identity, drift = rebind_parity(current["snapshot"], target["snapshot"])
+    if identity:
+        raise ModeError("REBIND_REPOSITORY_MISMATCH: the requested root is a different repository ("
+                        + ", ".join(identity) + ")")
+    if drift and not getattr(args, "accept_source_change", False):
+        raise ModeError("REBIND_SOURCE_CHANGED: the requested root changes what the runner executes ("
+                        + ", ".join(drift) + "); review it and pass --accept-source-change")
+    if ".remote-dev/project.env" not in ({entry["path"] for entry in target["snapshot"]["index"]}
+                                         | set(target["snapshot"]["selected_untracked"])):
+        raise ModeError("CONTRACT_NOT_CAPTURED: the requested root must carry the project contract in the existing policy")
+    journal = {"version": 1, "kind": "rebind", "plan_id": None, "toolkit_id": toolkit_id(),
+               "project": project, "previous_root": project["local_root"], "local_root": requested,
+               "runner_root": "/home/coder/projects/" + project["project_id"],
+               "snapshot_id": target["snapshot"]["snapshot_id"], "accepted_source_change": sorted(drift),
+               "token": secrets.token_hex(32), "phase": "planned", "state": "planned",
+               "created_at": int(time.time()), "writers_paused": True}
+    journal["operation_id"] = checksum(encode({key: journal[key] for key in
+                                               ("kind", "previous_root", "local_root", "snapshot_id")}
+                                              | {"project_id": project["project_id"],
+                                                 "generation": project["generation"]}))
+    return operation.execute_rebind(journal, store)
+
+
+def plan(args, store):
+    adopt = getattr(args, "adopt_target", False)
+    bound = store.for_context(args.for_context) if args.for_context else None
+    if args.for_context and not bound:
+        raise ModeError("UNBOUND_CONTEXT: establish explicit endpoints with --project-id, --from and project paths")
+    if bound:
+        project = dict(bound)
+        if args.profile and (args.profile != project["profile"] or args.coder_url != project["coder_url"]):
+            raise ModeError("PROFILE_MISMATCH: explicit routing differs from the bound project")
+    else:
+        required = (args.project_id, args.profile, args.coder_url, args.source_mode,
+                    args.local_project, args.development_workspace, args.runner_workspace, args.remote_project_dir)
+        if not all(required):
+            raise ModeError("ENDPOINTS_REQUIRED: supply profile, project-id, --from, local-project, development-workspace, runner-workspace and remote-project-dir")
+        if (store.read("projects", identifier(args.project_id, "project ID")) or store.for_context(args.local_project)
+                or store.superseded_owner(args.local_project)):
+            raise ModeError("PROJECT_ALREADY_BOUND: use --for-context with the existing managed project identity")
+        TRANSFER.safe_path(args.remote_project_dir)
+        project = {"project_id": identifier(args.project_id, "project ID"), "profile": args.profile,
+                   "coder_url": args.coder_url, "local_root": canonical(args.local_project),
+                   "development_workspace": identifier(args.development_workspace, "development workspace"),
+                   "runner_workspace": identifier(args.runner_workspace, "runner workspace"),
+                   "remote_project_dir": args.remote_project_dir, "active_mode": args.source_mode, "generation": 0}
+    if bound and getattr(args, "local_project", None) and canonical(args.local_project) != project["local_root"]:
+        # Moving the Mac anchor rewrites which checkout the project resolves
+        # from, so it is permitted only as part of a reviewed adoption of that
+        # exact existing checkout, and only while the Mac side is the inactive
+        # destination. Re-anchoring an active binding is `mode rebind`.
+        if not adopt:
+            raise ModeError("LOCAL_ROOT_IMMUTABLE: a bound project moves its Mac root only through an explicit --adopt-target plan")
+        if args.to != "local-agent":
+            raise ModeError("LOCAL_ROOT_IMMUTABLE: only a --to local-agent adoption may move the Mac root")
+        requested_root = canonical(args.local_project)
+        owner = store.for_context(requested_root) or store.superseded_owner(requested_root)
+        if owner and owner["project_id"] != project["project_id"]:
+            raise ModeError("PROJECT_ALREADY_BOUND: the requested Mac root belongs to another managed project")
+        project["superseded_local_roots"] = sorted(
+            (set(project.get("superseded_local_roots", [])) | {project["local_root"]}) - {requested_root})
+        project["local_root"] = requested_root
+    if project["active_mode"] == args.to:
+        raise ModeError("ALREADY_ACTIVE: requested mode is already the explicit source authority")
+    local_root = Path(project["local_root"])
+    if store.root == local_root or local_root in store.root.parents:
+        raise ModeError("STATE_PATH_CONFLICT: mode records must be outside the authoritative project checkout")
+    if project["development_workspace"] == project["runner_workspace"]:
+        raise ModeError("WORKSPACE_ROLE_MISMATCH: development and runner must be different workspaces")
+    allowed = sorted(set(args.allow_untracked) | set(project.get("allowed_untracked", [])))
+    lifecycle_timeout = getattr(args, "lifecycle_timeout_seconds", None) or project.get("lifecycle_timeout_seconds", 300)
+    if not 30 <= lifecycle_timeout <= 7200:
+        raise ModeError("INVALID_TIMEOUT: lifecycle timeout must be between 30 and 7200 seconds")
+    project["lifecycle_timeout_seconds"] = lifecycle_timeout
+    remote = Endpoint(project["profile"], project["coder_url"], project["development_workspace"], "development")
+    remote_root = "~/projects/" + project["remote_project_dir"]
+    requested = set(getattr(args, "prepare_workspace", []) or [])
+    if not requested and any(getattr(args, key, None) is not None for key in
+                            ("workspace_size", "workspace_template_version", "host_unbounded_memory_mib", "host_unbounded_cpu")):
+        raise ModeError("WORKSPACE_PREPARE_REQUIRED: allocation options require an explicit --prepare-workspace")
+    inactive = project["runner_workspace"] if args.to == "local-agent" else project["development_workspace"]
+    if requested - {inactive}:
+        raise ModeError("WORKSPACE_PREPARE_UNSUPPORTED: only the explicitly inactive destination may be prepared")
+    actions = []
+    if requested:
+        owner = WORKSPACE.Owner(project["profile"], project["coder_url"])
+        try:
+            actions.append(owner.freeze(inactive, "runner" if args.to == "local-agent" else "development",
+                                        getattr(args, "workspace_size", None), getattr(args, "workspace_template_version", None)))
+        except ValueError as error:
+            raise ModeError(str(error)) from error
+        memory_budget = getattr(args, "host_unbounded_memory_mib", None)
+        cpu_budget = getattr(args, "host_unbounded_cpu", None)
+        if memory_budget is not None or cpu_budget is not None:
+            if not memory_budget or memory_budget <= 0 or not cpu_budget or not 0 < cpu_budget < 10000:
+                raise ModeError("HOST_BUDGET_INVALID: specify positive shared memory and CPU budgets together")
+            actions[0]["unbounded_budget"] = {"memory": memory_budget * 1024**2, "cpu": cpu_budget}
+    def inspect_or_defer(endpoint, root, paths=()):
+        if endpoint.workspace not in requested:
+            return endpoint.inspect(root, paths)
+        return {"root": root.replace("~/", "/home/coder/", 1), "role": endpoint.role,
+                "deferred_workspace": endpoint.workspace}
+    local_info = Endpoint().inspect(project["local_root"], allowed)
+    remote_info = inspect_or_defer(remote, remote_root, allowed)
+    source, target = (remote_info, local_info) if args.to == "local-agent" else (local_info, remote_info)
+    if "snapshot" not in source:
+        raise ModeError("SOURCE_MISSING: explicit source is not a supported Git checkout")
+    blockers = []
+    if args.to == "local-agent" and any(any(character in entry["path"] for character in "\t\r\n") for entry in source["snapshot"]["worktree"]):
+        blockers.append("PROJECTION_CAPABILITY_UNSUPPORTED: the existing Local Agent transport cannot project paths containing tabs or line breaks")
+    if source.get("contract_error"):
+        blockers.append(source["contract_error"])
+    captured_paths = {entry["path"] for entry in source["snapshot"]["index"]} | set(source["snapshot"]["selected_untracked"])
+    if ".remote-dev/project.env" not in captured_paths:
+        blockers.append("CONTRACT_NOT_CAPTURED: explicitly allow the untracked project contract before transfer")
+    adoption = None
+    if target.get("exists") and not target.get("empty"):
+        previous = project.get("departures", {}).get(args.to)
+        target_fingerprint = {"tree": target["tree"], "snapshot": target.get("snapshot", {}).get("snapshot_id")}
+        if previous and target_fingerprint == previous:
+            pass
+        elif adopt:
+            if getattr(args, "confirm_adopt_root", None) != target["root"]:
+                raise ModeError("ADOPT_CONFIRMATION_REQUIRED: repeat the exact destination path in --confirm-adopt-root")
+            accepted = {label for label, option in ADOPTION_LOSS
+                        if getattr(args, option.lstrip("-").replace("-", "_"), False)}
+            refusals, dropped = adoption_review(source, target, accepted)
+            blockers.extend(refusals)
+            adoption = {"root": target["root"], "accepted": sorted(accepted), "dropped": dropped}
+        else:
+            blockers.append("TARGET_NOT_MANAGED: nonempty target does not match a previous departure receipt; "
+                            "transfer to a new path or adopt this exact checkout with --adopt-target")
+    elif adopt:
+        raise ModeError("ADOPT_TARGET_EMPTY: adoption requires an existing nonempty destination checkout")
+    if target.get("deferred_workspace"):
+        if adopt:
+            raise ModeError("ADOPT_TARGET_DEFERRED: a destination prepared during apply cannot be inspected for adoption")
+        if not project.get("departures", {}).get(args.to):
+            blockers.append("TARGET_DEPARTURE_REQUIRED: a stopped development target requires a prior managed departure receipt")
+    runner_info = inspect_or_defer(Endpoint(project["profile"], project["coder_url"], project["runner_workspace"], "runner"),
+                                   "~/projects/" + project["project_id"])
+    for label, info in (("development", remote_info), ("runner", runner_info)):
+        if info.get("deferred_workspace"):
+            continue
+        for name, feature in info.get("image_features", {}).items():
+            if not feature["matches"]:
+                blockers.append("IMAGE_UPDATE_REQUIRED: " + label + " requires the reviewed image version of " + name)
+        if source.get("contract", {}).get("docker_capability") == "containers" and not info.get("docker_ready"):
+            blockers.append("DOCKER_CAPABILITY_REQUIRED: " + label + " must provide a verified internal Docker daemon")
+    required_bytes = 4 * (source.get("source_bytes", 0) + source.get("git_storage_bytes", 0)) + 512 * 1024 * 1024
+    for label, info in (("source", source), ("target", target), ("runner", runner_info)):
+        if info.get("deferred_workspace"):
+            continue
+        if info["free_bytes"] < required_bytes:
+            blockers.append("DISK_CAPACITY_REQUIRED: " + label + " lacks free bytes for source transfer and recovery copies")
+    if runner_info.get("exists") and not runner_info.get("empty") and not bound:
+        blockers.append("RUNNER_OWNERSHIP_REQUIRED: inspect the existing Local Agent binding before reusing a nonempty runner")
+    project["allowed_untracked"] = allowed
+    project["remote_root"] = remote_info["root"]
+    now = int(time.time())
+    result = {"version": 1, "created_at": now, "expires_at": now + 7200, "toolkit_id": toolkit_id(),
+              "project": project, "from": project["active_mode"], "to": args.to, "source": source,
+              "target": target, "runner": runner_info, "blockers": blockers,
+              "data_policy": args.data_policy, "secrets_manifest": args.secrets_manifest,
+              "transfer_free_bytes_required": required_bytes, "adoption": adoption,
+              "new_workspace_actions": actions, "source_policy": "explicit-source-authority"}
+    if actions:
+        try:
+            facts = owner.host_snapshot()
+            WORKSPACE.CAPACITY.admit(facts, actions[0]["limits"], required_bytes, actions[0].get("unbounded_budget"))
+            actions[0]["host_at_plan"] = facts
+        except ValueError as error:
+            blockers.append(str(error))
+        result["deferred_checks"] = ["destination checkout and departure parity after start",
+                                     "image, daemon, disk and role before source stop",
+                                     "host doctor and capacity before action; coexistence after action"]
+    if not args.data_policy:
+        blockers.append("DATA_POLICY_REQUIRED: choose isolated development data or a reviewed project dump/restore operation")
+    if args.data_policy == "project-restore":
+        blockers.append("DATA_RESTORE_REQUIRED: complete a separately reviewed project dump/restore route; this operation supports isolated data only")
+    if args.secrets_manifest:
+        result["secrets_route"] = secrets_route(args.secrets_manifest, project, args.to,
+                                                 runner_info["root"] if args.to == "local-agent" else remote_info["root"],
+                                                 remote_info["root"] if args.to == "local-agent" else runner_info["root"])
+        if result["secrets_route"]["identity"]["manifest_version"] == "3":
+            result["secrets_deferred_checks"] = ["binding identity and remote-writable policy", "source metadata and role", "target canonical parent directories"]
+        if args.to == "local-agent":
+            secret_paths = sorted({entry[1] for entry in result["secrets_route"]["files"]})
+            existing_writable = project.get("remote_writable", [])
+            if bound and any(path not in existing_writable for path in secret_paths):
+                blockers.append("RUNNER_POLICY_CHANGE_REQUIRED: the existing binding must already allow the reviewed secret destinations")
+            elif not bound:
+                project["remote_writable"] = secret_paths
+    result["plan_id"] = checksum(encode(result))
+    path = store.create("plans", result["plan_id"], result)
+    return {"plan_id": result["plan_id"], "plan_file": path, "from": result["from"], "to": result["to"],
+            "source_root": source["root"], "target_root": target["root"], "source_snapshot": source["snapshot"]["snapshot_id"],
+            "selected_untracked": source["snapshot"]["selected_untracked"], "untracked_inventory": source["untracked_inventory"],
+            "blockers": blockers, "new_workspace_actions": actions,
+            # Counts only here; the owner-only plan file carries the exact
+            # destination entries, which can include ignored secret filenames.
+            "adoption": adoption and {"root": adoption["root"], "accepted": adoption["accepted"],
+                                      "dropped": {key: len(value) for key, value in adoption["dropped"].items()}},
+            "state": "blocked" if blockers else "planned"}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile")
+    parser.add_argument("--coder-url")
+    sub = parser.add_subparsers(dest="command", required=True)
+    item = sub.add_parser("status")
+    item.add_argument("--for-context", required=True)
+    item = sub.add_parser("plan")
+    item.add_argument("--for-context")
+    item.add_argument("--project-id")
+    item.add_argument("--from", dest="source_mode", choices=("remote", "local-agent"))
+    item.add_argument("--to", required=True, choices=("remote", "local-agent"))
+    item.add_argument("--local-project")
+    item.add_argument("--development-workspace")
+    item.add_argument("--runner-workspace")
+    item.add_argument("--remote-project-dir")
+    item.add_argument("--allow-untracked", action="append", default=[])
+    item.add_argument("--adopt-target", action="store_true",
+                      help="prove the existing nonempty destination already holds this project instead of requiring a departure receipt")
+    item.add_argument("--confirm-adopt-root", help="exact destination checkout path being adopted")
+    item.add_argument("--accept-untracked-loss", action="store_true",
+                      help="accept that reviewed destination untracked files do not survive publication")
+    item.add_argument("--accept-ignored-loss", action="store_true",
+                      help="accept that reviewed destination ignored data does not survive publication")
+    item.add_argument("--accept-ref-loss", action="store_true",
+                      help="accept that reviewed destination-only branches, tags and stash do not survive publication")
+    item.add_argument("--data-policy", choices=("isolated", "project-restore"))
+    item.add_argument("--secrets-manifest")
+    item.add_argument("--lifecycle-timeout-seconds", type=int, help="reviewed per-hook time budget, 30..7200 seconds")
+    item.add_argument("--prepare-workspace", action="append", default=[], help="explicit inactive destination to create/start during apply")
+    item.add_argument("--workspace-size", help="required size for a new runner; existing workspaces cannot be resized")
+    item.add_argument("--workspace-template-version", help="exact template version UUID for a new runner")
+    item.add_argument("--host-unbounded-memory-mib", type=int, help="reviewed shared memory budget for all uncapped neighboring workloads")
+    item.add_argument("--host-unbounded-cpu", type=float, help="reviewed shared CPU-core budget for all uncapped neighboring workloads")
+    for command in ("apply", "resume", "abort", "forget"):
+        item = sub.add_parser(command, help="report and discard the retained areas of a finished operation"
+                                            if command == "forget" else None)
+        item.add_argument("identity", help="reviewed plan ID for apply, operation ID for resume/abort/forget")
+        if command == "forget":
+            item.add_argument("--confirm-discard-previous", action="store_true",
+                              help="discard the replaced destination and any preserved candidate, not only the transport archives")
+        if command == "apply":
+            item.add_argument("--writers-paused", action="store_true", help="assert that source and target IDE/agent writers are paused")
+    item = sub.add_parser("rebind", help="re-anchor the active local-agent binding onto another local Git root")
+    item.add_argument("--for-context", required=True)
+    item.add_argument("--to-root", required=True, help="absolute canonical Git root that becomes the source authority")
+    item.add_argument("--confirm-root", required=True, help="exact requested root, repeated")
+    item.add_argument("--accept-source-change", action="store_true",
+                      help="accept that the requested root changes what the runner executes")
+    item.add_argument("--writers-paused", action="store_true", help="assert that writers at both Mac roots are paused")
+    item = sub.add_parser("secrets", help="explicitly apply the reviewed secret route at the published-inactive checkpoint")
+    item.add_argument("identity", help="operation ID")
+    item.add_argument("--confirm", required=True, help="exact target workspace")
+    item.add_argument("--confirm-profile", required=True)
+    item.add_argument("--confirm-origin", required=True)
+    item.add_argument("--confirm-source", help="exact source workspace for a version-3 secret route")
+    item.add_argument("--replace", action="store_true")
+    args = parser.parse_args()
+    try:
+        store = Store()
+        if args.command == "status":
+            bound = store.for_context(args.for_context)
+            result = {"state": "unbound", "context": canonical(args.for_context)} if not bound else dict(bound)
+            if bound:
+                pending = store.read("pending", bound["project_id"])
+                if pending and not pending.get("complete"):
+                    journal = store.read("operations", pending["operation_id"])
+                    result["pending"] = {k: journal[k] for k in ("operation_id", "state", "phase")}
+                # Read the durable journal only: reporting retained areas must
+                # not reach an endpoint, so status stays offline and read-only.
+                retained, operations = [], store.root / "operations"
+                if operations.exists() and not operations.is_symlink():
+                    for file in sorted(operations.glob("*.json")):
+                        journal = store.read("operations", file.stem)
+                        if journal.get("state") not in ("activated", "aborted") or journal.get("areas_discarded"):
+                            continue
+                        # A re-anchor journal owns its project directly; a
+                        # transfer journal names it through its reviewed plan.
+                        owner = journal.get("project") or (store.read("plans", journal["plan_id"]) or {}).get("project")
+                        if not owner or owner["project_id"] != bound["project_id"]:
+                            continue
+                        retained.append({"operation_id": journal["operation_id"], "state": journal["state"],
+                                         "measure_command": "bin/remote-dev mode forget " + journal["operation_id"]})
+                result["retained_operation_areas"] = retained
+            else:
+                superseded = store.superseded_owner(args.for_context)
+                if superseded:
+                    # The old duplicate keeps its inactive fence; say where the
+                    # current source authority lives instead of reporting it
+                    # as an unmanaged path an operator could start work in.
+                    result.update(state="superseded", project_id=superseded["project_id"],
+                                  active_mode=superseded["active_mode"], local_root=superseded["local_root"])
+                pending_directory = store.root / "pending"
+                if pending_directory.exists():
+                    for file in pending_directory.glob("*.json"):
+                        pending = store.read("pending", file.stem)
+                        if pending.get("complete"):
+                            continue
+                        journal = store.read("operations", pending["operation_id"])
+                        reviewed = store.read("plans", journal["plan_id"])
+                        root = Path(reviewed["project"]["local_root"])
+                        context = Path(canonical(args.for_context))
+                        if context == root or root in context.parents:
+                            result.update(state="pending", active_mode=reviewed["from"],
+                                          pending={k: journal[k] for k in ("operation_id", "state", "phase")})
+        elif args.command == "plan":
+            result = plan(args, store)
+        elif args.command == "rebind":
+            result = rebind(args, store, operation_module())
+        else:
+            result = operation_module().execute(args, store)
+        print(json.dumps(result, sort_keys=True, ensure_ascii=True))
+    except (ModeError, TRANSFER.TransferError, CONTRACT.ContractError, ENDPOINT.EndpointError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print(str(error) if isinstance(error, (ModeError, TRANSFER.TransferError, CONTRACT.ContractError, ENDPOINT.EndpointError))
+              else f"MODE_FAILED: {type(error).__name__}; authority is uncertain until mode status and the operation journal are checked; resume the same operation", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: remote-dev-codex-desktop --profile <name> --coder-url <url> \
+  <workspace> [--project-dir <path>]
+
+Configure this Mac so Codex Desktop can connect to one Coder workspace over
+SSH. The command keeps each Coder deployment isolated, performs interactive
+Coder login when required, installs a discoverable SSH alias, and verifies the
+remote Codex runtime.
+EOF
+}
+
+profile=
+coder_url=
+workspace=
+project_dir=
+while (( $# > 0 )); do
+  case "$1" in
+    --profile)
+      (( $# >= 2 )) || { echo '--profile requires a name' >&2; exit 2; }
+      profile=$2
+      shift 2
+      ;;
+    --coder-url)
+      (( $# >= 2 )) || { echo '--coder-url requires a URL' >&2; exit 2; }
+      coder_url=$2
+      shift 2
+      ;;
+    --project-dir)
+      (( $# >= 2 )) || { echo '--project-dir requires a path' >&2; exit 2; }
+      project_dir=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --*)
+      printf 'unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n $workspace ]]; then
+        printf 'unexpected argument: %s\n' "$1" >&2
+        usage >&2
+        exit 2
+      fi
+      workspace=$1
+      shift
+      ;;
+  esac
+done
+
+[[ -n $profile ]] || { echo 'desktop setup requires a profile' >&2; exit 2; }
+[[ $profile =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
+  printf 'invalid profile name: %s\n' "$profile" >&2
+  exit 2
+}
+# HTTPS for a published Coder, or the Mac end of an SSH forward.
+[[ $coder_url == https://* || $coder_url =~ ^http://127\.0\.0\.1:[0-9]+$ ]] || {
+  printf 'desktop setup requires an HTTPS or SSH-forward Coder URL: %s\n' "$coder_url" >&2
+  exit 2
+}
+[[ -n $workspace ]] || { echo 'codex-desktop requires a workspace name' >&2; exit 2; }
+[[ $workspace =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+  printf 'invalid Coder workspace name: %s\n' "$workspace" >&2
+  exit 2
+}
+
+project_dir=${project_dir:-$workspace}
+if [[ $project_dir = /* || ! $project_dir =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+  printf 'project directory must be relative to /home/coder/projects: %s\n' \
+    "$project_dir" >&2
+  exit 2
+fi
+IFS=/ read -r -a project_parts <<<"$project_dir"
+for project_part in "${project_parts[@]}"; do
+  if [[ $project_part == . || $project_part == .. ]]; then
+    printf 'project directory must not contain dot components: %s\n' \
+      "$project_dir" >&2
+    exit 2
+  fi
+done
+
+if [[ $(uname -s) != Darwin ]]; then
+  echo 'codex-desktop setup currently supports the macOS desktop client.' >&2
+  exit 1
+fi
+
+for required_command in coder ssh awk mktemp; do
+  command -v "$required_command" >/dev/null 2>&1 || {
+    printf 'required local command is missing: %s\n' "$required_command" >&2
+    exit 1
+  }
+done
+
+coder_bin=$(command -v coder)
+config_root=${REMOTE_DEV_CODEX_DESKTOP_CONFIG_ROOT:-$HOME/Library/Application Support/remote-dev/coder}
+coder_config=$config_root/$profile
+coder_url_file=$coder_config/url
+ssh_dir=$HOME/.ssh
+ssh_config=$ssh_dir/config
+ssh_fragment=$ssh_dir/remote-dev-$profile.conf
+include_line="Include \"$ssh_fragment\""
+hostname_suffix=$profile.coder
+ssh_host_prefix=$profile.
+ssh_alias=$ssh_host_prefix$workspace
+expected_project_dir=/home/coder/projects/$project_dir
+expected_worktree_root=/home/coder/projects/.codex-worktrees
+
+umask 077
+mkdir -p "$coder_config" "$ssh_dir"
+chmod 0700 "$coder_config" "$ssh_dir"
+if [[ -L $coder_url_file || ( -e $coder_url_file && ! -f $coder_url_file ) ]]; then
+  printf 'refusing to replace a non-regular Coder URL file: %s\n' \
+    "$coder_url_file" >&2
+  exit 1
+fi
+coder_url_temp=$(mktemp "$coder_config/.url.XXXXXX")
+printf '%s\n' "$coder_url" > "$coder_url_temp"
+chmod 0600 "$coder_url_temp"
+mv "$coder_url_temp" "$coder_url_file"
+if [[ -L $ssh_config || ( -e $ssh_config && ! -f $ssh_config ) ]]; then
+  printf 'refusing to modify a non-regular SSH config: %s\n' "$ssh_config" >&2
+  exit 1
+fi
+if [[ -L $ssh_fragment || ( -e $ssh_fragment && ! -f $ssh_fragment ) ]]; then
+  printf 'refusing to replace a non-regular SSH fragment: %s\n' \
+    "$ssh_fragment" >&2
+  exit 1
+fi
+
+coder_command=("$coder_bin" --no-version-warning --global-config "$coder_config")
+if ! "${coder_command[@]}" --url "$coder_url" whoami >/dev/null 2>&1; then
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    cat >&2 <<EOF
+Coder login is required for $coder_url.
+Run this command from an interactive Terminal on the Mac and complete the
+browser sign-in; no deployment token will be copied to the Mac.
+EOF
+    exit 1
+  fi
+  printf 'Starting interactive Coder login for %s...\n' "$coder_url"
+  "${coder_command[@]}" login "$coder_url"
+fi
+if ! "${coder_command[@]}" --url "$coder_url" whoami >/dev/null; then
+  printf 'Coder login did not produce an authenticated session for %s.\n' \
+    "$coder_url" >&2
+  exit 1
+fi
+
+"${coder_command[@]}" --url "$coder_url" config-ssh \
+  --disable-autostart --wait=no \
+  --no-wildcard \
+  --ssh-host-prefix "$ssh_host_prefix" \
+  --hostname-suffix "$hostname_suffix" \
+  --ssh-config-file "$ssh_fragment" \
+  --yes
+if grep -Eq '^[[:space:]]*ProxyCommand .*coder --global-config([[:space:]]|$)' "$ssh_fragment"; then
+  temp=$(mktemp "$ssh_dir/.remote-dev-coder-proxy.XXXXXX")
+  awk '{ sub(/coder --global-config/, "coder --no-version-warning --global-config"); print }' \
+    "$ssh_fragment" > "$temp"
+  chmod 0600 "$temp"
+  mv "$temp" "$ssh_fragment"
+fi
+chmod 0600 "$ssh_fragment"
+
+if ! grep -Fxq "Host $ssh_alias" "$ssh_fragment"; then
+  printf 'Coder did not generate the expected concrete SSH alias: %s\n' \
+    "$ssh_alias" >&2
+  printf 'Available concrete hosts in %s:\n' "$ssh_fragment" >&2
+  sed -n 's/^Host /  /p' "$ssh_fragment" >&2
+  exit 1
+fi
+
+ssh_config_created=false
+if [[ ! -e $ssh_config ]]; then
+  : > "$ssh_config"
+  chmod 0600 "$ssh_config"
+  ssh_config_created=true
+fi
+
+ssh_backup=
+if ! grep -Fxq "$include_line" "$ssh_config"; then
+  ssh_temp=$(mktemp "$ssh_dir/.remote-dev-ssh-config.XXXXXX")
+  cleanup() {
+    rm -f -- "${ssh_temp:-}"
+  }
+  trap cleanup EXIT
+  if [[ $ssh_config_created == false ]]; then
+    ssh_backup=$ssh_config.remote-dev-backup-$(date +%Y%m%d%H%M%S)-$$
+    cp -p "$ssh_config" "$ssh_backup"
+  fi
+  awk -v include_line="$include_line" '
+    BEGIN { inserted = 0 }
+    !inserted && /^[[:space:]]*(Host|Match)[[:space:]]/ {
+      print include_line
+      print ""
+      inserted = 1
+    }
+    { print }
+    END {
+      if (!inserted) {
+        if (NR > 0) print ""
+        print include_line
+      }
+    }
+  ' "$ssh_config" > "$ssh_temp"
+  chmod 0600 "$ssh_temp"
+  mv "$ssh_temp" "$ssh_config"
+  ssh_temp=
+  trap - EXIT
+fi
+
+ssh -F "$ssh_config" -G "$ssh_alias" >/dev/null
+
+remote_args=(
+  /usr/local/bin/remote-dev-codex
+  --check
+  --project-dir "$project_dir"
+)
+printf -v remote_check ' %q' "${remote_args[@]}"
+remote_check="set -eu; command -v codex; codex --version; exec$remote_check"
+check_output=$(ssh \
+  -F "$ssh_config" \
+  -o BatchMode=yes \
+  -o ConnectTimeout=30 \
+  "$ssh_alias" "$remote_check")
+printf '%s\n' "$check_output"
+
+if [[ $check_output == *'codex_auth=required'* ]]; then
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    cat >&2 <<EOF
+Remote Codex authentication is required.
+Run this command again from an interactive Terminal to complete device login.
+EOF
+    exit 1
+  fi
+  printf 'Starting remote Codex device authentication...\n'
+  ssh -F "$ssh_config" -t "$ssh_alias" \
+    /usr/local/bin/remote-dev-codex \
+    --project-dir "$project_dir" -- --version
+  check_output=$(ssh \
+    -F "$ssh_config" \
+    -o BatchMode=yes \
+    -o ConnectTimeout=30 \
+    "$ssh_alias" "$remote_check")
+  printf '%s\n' "$check_output"
+fi
+
+for expected_value in \
+  'codex_path=/usr/local/bin/codex' \
+  'codex_auth=ready' \
+  "project_dir=$expected_project_dir"; do
+  if [[ $check_output != *"$expected_value"* ]]; then
+    printf 'remote Codex readiness omitted expected value: %s\n' \
+      "$expected_value" >&2
+    exit 1
+  fi
+done
+
+codex_version=$(sed -n 's/^codex_version=//p' <<<"$check_output" | tail -1)
+worktree_root_state=$(sed -n 's/^worktree_root_state=//p' <<<"$check_output" | tail -1)
+branch_sync_skill_state=$(sed -n 's/^branch_sync_skill_state=//p' <<<"$check_output" | tail -1)
+cat <<EOF
+
+READY    Codex Desktop SSH connection is configured on this Mac.
+Host     $ssh_alias
+Folder   $expected_project_dir
+Worktrees $expected_worktree_root
+Version  $codex_version
+
+Open Codex Desktop:
+  Settings -> Connections -> SSH -> Add
+Choose $ssh_alias and select Connect. In that connection row, click the button
+whose icon is a folder with a small plus, then add:
+  $expected_project_dir
+Expected visible result: green Connected status and Codex version from above.
+
+EOF
+if [[ $worktree_root_state == ready && $branch_sync_skill_state == ready ]]; then
+  cat <<EOF
+For Codex-managed linked worktrees, open:
+  Settings -> Worktrees -> Worktree root
+Set the remote connection's root to:
+  $expected_worktree_root
+Expected visible result: Worktree tasks create their checkout below that
+persistent remote path, not on the Mac and not in a disposable container layer.
+
+EOF
+else
+  cat <<EOF
+Worktree capability is not ready for this connection.
+Root state: $worktree_root_state
+Branch-sync skill state: $branch_sync_skill_state
+Ordinary Codex SSH remains usable. To enable managed worktrees, run:
+  bin/remote-dev --profile $profile install
+Then choose Update for $workspace in Coder and rerun this command. If the skill
+state is conflict, move the existing non-symlink skill path aside first.
+
+EOF
+fi
+cat <<EOF
+
+Project variable files are a separate flow. A project may declare exact routes
+in .remote-dev/worktree-vars.tsv; synchronize them into any linked worktree with:
+  bin/remote-dev --profile $profile worktree-vars $workspace \
+    --source-dir $project_dir --worktree-dir <relative-worktree-path>
+Find the exact target path from a remote terminal with:
+  git -C $expected_project_dir worktree list --porcelain
+If a target differs, inspect it first and then explicitly add --replace.
+
+When a remote task starts an HTTP service on <port>, make it reachable from
+this Mac with:
+  bin/remote-dev --profile $profile preview $workspace <port>
+Wait for READY, then open the printed local URL. Press Ctrl+C to stop access.
+EOF
+if [[ -n $ssh_backup ]]; then
+  printf 'SSH config backup: %s\n' "$ssh_backup"
+fi

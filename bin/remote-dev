@@ -1,0 +1,1755 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ssh_options=(-o ControlMaster=no -o ControlPath=none -o ClearAllForwardings=yes)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck disable=SC1091
+. "$repo_root/deploy/host-profiles/load.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: remote-dev [--profile <name>] <command>
+
+Select the server with --profile <name> or REMOTE_DEV_PROFILE. There is no
+default profile; REMOTE_DEV_HOST cannot change the identity of a selected profile.
+
+Commands:
+  quickstart   Bootstrap a fresh Ubuntu server and install everything in one run
+  init         Create a minimal host profile (SSH forward, host egress)
+  profile      Show the selected non-secret host identity fields
+  install      Reconcile Coder deployment, owner token, template, and schedule
+  sysbox-install Install the pinned isolated-container runtime in a maintenance window
+  secrets      Plan, apply, or verify an explicit project secret manifest
+  status       Show host, Coder, workspace, and container resource state
+  audit        Flag stopped/orphaned managed resources and capacity risks
+  doctor       Verify SSH, firewall, listeners, Docker, database, and Coder
+  codex        Start a workspace, authenticate Codex when needed, and launch it
+  codex-desktop Configure this Mac for Codex Desktop SSH to a Coder workspace
+  codex-update Build, publish and apply an exact Codex version to one workspace
+  pids-rollout Check or apply the per-workspace PID policy to one quiesced workspace
+  workspace    Create, start, inspect, or update a profile-bound Coder workspace
+  local-agent  Keep Codex/Git local and execute through a bound runner workspace
+  mode         Plan, apply, resume, or abort a remote/local-agent handoff
+  project-setup Run one project-owned setup/start/health contract
+  worktree-vars Synchronize declared variable files into any linked worktree
+  preview      Make one workspace HTTP port reachable from this Mac
+  debug-forward Make one runner TCP/debug port reachable from this Mac
+  credentials  Reveal, verify, and finalize one-time owner credentials
+  token-update Replace the protected operator session from stdin
+  forward      Keep the Coder dashboard forwarded to this Mac over SSH
+EOF
+}
+
+validate_project_relative_path() {
+  local value=$1
+  local label=$2
+  local segment
+  local -a segments=()
+  if [[ -z $value || $value = /* || $value = */ || $value = *//* ]]; then
+    printf 'invalid %s: %s\n' "$label" "$value" >&2
+    return 1
+  fi
+  IFS=/ read -r -a segments <<<"$value"
+  for segment in "${segments[@]}"; do
+    if [[ $segment == . || $segment == .. || ! $segment =~ ^[A-Za-z0-9._-]+$ ]]; then
+      printf 'invalid %s: %s\n' "$label" "$value" >&2
+      return 1
+    fi
+  done
+}
+
+remote() {
+  ssh "${ssh_options[@]}" "$host" "$@"
+}
+
+# ssh joins its arguments into one remote command line, which drops empty
+# values and re-splits the rest. Positional arguments for a remote script are
+# therefore quoted one by one.
+remote_script() {
+  local command=$1 quoted argument
+  shift
+  for argument in "$@"; do
+    printf -v quoted '%q' "$argument"
+    command+=" $quoted"
+  done
+  ssh "${ssh_options[@]}" "$host" "$command"
+}
+
+run_workspace_codex() {
+  local workspace=${1:-}
+  if [[ -z $workspace ]]; then
+    echo 'codex requires a workspace name' >&2
+    exit 2
+  fi
+  if [[ ! $workspace =~ ^([A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'invalid Coder workspace name: %s\n' "$workspace" >&2
+    exit 2
+  fi
+  shift
+
+  local -a preflight_args=(
+    /opt/coder ssh --wait=yes "$workspace" --
+    /bin/sh -c
+    '/usr/local/bin/remote-dev-workspace-role require development >/dev/null && /usr/local/bin/remote-dev-codex --help'
+  )
+  local preflight_command
+  printf -v preflight_command ' %q' "${preflight_args[@]}"
+  local preflight_remote
+  preflight_remote="set -eu; token=\$(tr -d '\\r\\n' < /opt/remote-dev/coder/operator.session); exec docker exec -e CODER_URL=http://127.0.0.1:7080 -e CODER_SESSION_TOKEN=\"\$token\" remote-dev-coder-coder-1$preflight_command"
+  local preflight_output preflight_status=0
+  if preflight_output=$(ssh "${ssh_options[@]}" "$host" \
+    "$preflight_remote" 2>&1); then
+    :
+  else
+    preflight_status=$?
+  fi
+  if (( preflight_status == 127 )) && \
+     [[ $preflight_output == *'/usr/local/bin/remote-dev-codex: No such file or directory'* || \
+        $preflight_output == *'/usr/local/bin/remote-dev-codex: not found'* || \
+        $preflight_output == *'/usr/local/bin/remote-dev-workspace-role: No such file or directory'* || \
+        $preflight_output == *'/usr/local/bin/remote-dev-workspace-role: not found'* ]]; then
+    cat >&2 <<EOF
+Workspace $workspace does not contain the current Remote Dev Codex helper.
+Run:
+  bin/remote-dev --profile $REMOTE_DEV_PROFILE install
+Then choose Update for $workspace in Coder and retry this command.
+EOF
+    exit 1
+  fi
+  if (( preflight_status != 0 )); then
+    if [[ -n $preflight_output ]]; then
+      printf '%s\n' "$preflight_output" >&2
+    fi
+    printf 'Unable to verify Codex helper in workspace %s (exit %s).\n' \
+      "$workspace" "$preflight_status" >&2
+    exit "$preflight_status"
+  fi
+
+  local -a coder_args=(/opt/coder ssh --wait=yes)
+  local -a docker_tty=(-i)
+  local interactive=false
+  if [[ -t 0 && -t 1 ]]; then
+    interactive=true
+    coder_args+=(--tty)
+    docker_tty=(-it)
+  fi
+  coder_args+=("$workspace" -- /usr/local/bin/remote-dev-codex "$@")
+
+  local coder_command
+  printf -v coder_command ' %q' "${coder_args[@]}"
+  local remote_command
+  remote_command="set -eu; token=\$(tr -d '\\r\\n' < /opt/remote-dev/coder/operator.session); exec docker exec ${docker_tty[*]} -e CODER_URL=http://127.0.0.1:7080 -e CODER_SESSION_TOKEN=\"\$token\" remote-dev-coder-coder-1$coder_command"
+  if [[ $interactive == true ]]; then
+    exec ssh "${ssh_options[@]}" -tt "$host" "$remote_command"
+  fi
+  exec ssh "${ssh_options[@]}" "$host" "$remote_command"
+}
+
+run_project_setup() {
+  local workspace=${1:-}
+  if [[ -z $workspace ]]; then
+    echo 'project-setup requires a workspace name and --project-dir' >&2
+    exit 2
+  fi
+  if [[ ! $workspace =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'invalid Coder workspace name: %s\n' "$workspace" >&2
+    exit 2
+  fi
+  shift
+
+  local project_dir=
+  while (( $# > 0 )); do
+    case "$1" in
+      --project-dir)
+        (( $# >= 2 )) || { echo '--project-dir requires a relative path' >&2; exit 2; }
+        project_dir=$2
+        shift 2
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: remote-dev [--profile <name>] project-setup <workspace> \
+  --project-dir <relative-path>
+
+Run the project-owned .remote-dev/project.env contract in an existing Coder
+workspace, wait for its loopback health URL, and print Coder Connect plus
+preview recovery entry points.
+EOF
+        exit 0
+        ;;
+      *)
+        printf 'unexpected project-setup argument: %s\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+  done
+  [[ -n $project_dir && $project_dir != /* ]] || {
+    printf 'project-setup requires a project directory relative to ~/projects\n' >&2
+    exit 2
+  }
+  validate_project_relative_path "$project_dir" 'project directory' || exit 2
+
+  local -a preflight_args=(
+    /opt/coder ssh --disable-autostart --wait=no "$workspace" --
+    /bin/sh -c
+    '/usr/local/bin/remote-dev-workspace-role require development >/dev/null && /usr/local/bin/remote-dev-project-setup --help'
+  )
+  local preflight_command
+  printf -v preflight_command ' %q' "${preflight_args[@]}"
+  local preflight_remote
+  preflight_remote="set -eu; token=\$(tr -d '\\r\\n' < /opt/remote-dev/coder/operator.session); exec docker exec -e CODER_URL=http://127.0.0.1:7080 -e CODER_SESSION_TOKEN=\"\$token\" remote-dev-coder-coder-1$preflight_command"
+  local preflight_output preflight_status=0
+  if preflight_output=$(ssh "${ssh_options[@]}" "$host" \
+    "$preflight_remote" 2>&1); then
+    :
+  else
+    preflight_status=$?
+  fi
+  if (( preflight_status == 127 )) && \
+     [[ $preflight_output == *'/usr/local/bin/remote-dev-project-setup: No such file or directory'* || \
+        $preflight_output == *'/usr/local/bin/remote-dev-project-setup: not found'* || \
+        $preflight_output == *'/usr/local/bin/remote-dev-workspace-role: No such file or directory'* || \
+        $preflight_output == *'/usr/local/bin/remote-dev-workspace-role: not found'* ]]; then
+    cat >&2 <<EOF
+Workspace $workspace does not contain the current project setup helper.
+Run:
+  bin/remote-dev --profile $REMOTE_DEV_PROFILE install
+Then choose Update for $workspace in Coder and retry this command.
+EOF
+    exit 1
+  fi
+  if (( preflight_status != 0 )); then
+    [[ -z $preflight_output ]] || printf '%s\n' "$preflight_output" >&2
+    cat >&2 <<EOF
+Unable to reach project setup in workspace $workspace (exit $preflight_status).
+Recovery Start the workspace in Coder, wait for a healthy agent, and rerun.
+EOF
+    exit "$preflight_status"
+  fi
+
+  local -a coder_args=(
+    /opt/coder ssh --disable-autostart --wait=no "$workspace" --
+    /usr/local/bin/remote-dev-project-setup
+    --profile "$REMOTE_DEV_PROFILE"
+    --workspace "$workspace"
+    --project-dir "$project_dir"
+  )
+  local coder_command
+  printf -v coder_command ' %q' "${coder_args[@]}"
+  local remote_command
+  remote_command="set -eu; token=\$(tr -d '\\r\\n' < /opt/remote-dev/coder/operator.session); exec docker exec -i -e CODER_URL=http://127.0.0.1:7080 -e CODER_SESSION_TOKEN=\"\$token\" remote-dev-coder-coder-1$coder_command"
+  exec ssh "${ssh_options[@]}" "$host" "$remote_command"
+}
+
+run_worktree_vars() {
+  local workspace=${1:-}
+  if [[ -z $workspace ]]; then
+    echo 'worktree-vars requires a workspace, --source-dir, and --worktree-dir' >&2
+    exit 2
+  fi
+  if [[ ! $workspace =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'invalid Coder workspace name: %s\n' "$workspace" >&2
+    exit 2
+  fi
+  shift
+
+  local source_dir=
+  local worktree_dir=
+  local replace=false
+  while (( $# > 0 )); do
+    case "$1" in
+      --source-dir)
+        (( $# >= 2 )) || { echo '--source-dir requires a relative path' >&2; exit 2; }
+        source_dir=$2
+        shift 2
+        ;;
+      --worktree-dir)
+        (( $# >= 2 )) || { echo '--worktree-dir requires a relative path' >&2; exit 2; }
+        worktree_dir=$2
+        shift 2
+        ;;
+      --replace)
+        replace=true
+        shift
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: remote-dev [--profile <name>] worktree-vars <workspace> \
+  --source-dir <relative-path> --worktree-dir <relative-path> [--replace]
+
+Synchronize exact project-owned variable files from one Git worktree to any
+linked worktree. Routes come from the source tree's non-secret
+.remote-dev/worktree-vars.tsv manifest; file values are never printed.
+EOF
+        exit 0
+        ;;
+      *)
+        printf 'unexpected worktree-vars argument: %s\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+  done
+  [[ -n $source_dir && -n $worktree_dir ]] || {
+    echo 'worktree-vars requires --source-dir and --worktree-dir' >&2
+    exit 2
+  }
+  validate_project_relative_path "$source_dir" 'source directory' || exit 2
+  validate_project_relative_path "$worktree_dir" 'worktree directory' || exit 2
+
+  local -a preflight_args=(
+    /opt/coder ssh --disable-autostart --wait=no "$workspace" --
+    /bin/sh -c
+    '/usr/local/bin/remote-dev-workspace-role require development >/dev/null && /usr/local/bin/remote-dev-worktree-vars --help'
+  )
+  local preflight_command
+  printf -v preflight_command ' %q' "${preflight_args[@]}"
+  local preflight_remote
+  preflight_remote="set -eu; token=\$(tr -d '\\r\\n' < /opt/remote-dev/coder/operator.session); exec docker exec -e CODER_URL=http://127.0.0.1:7080 -e CODER_SESSION_TOKEN=\"\$token\" remote-dev-coder-coder-1$preflight_command"
+  local preflight_output preflight_status=0
+  if preflight_output=$(ssh "${ssh_options[@]}" "$host" \
+    "$preflight_remote" 2>&1); then
+    :
+  else
+    preflight_status=$?
+  fi
+  if (( preflight_status == 127 )) && \
+     [[ $preflight_output == *'/usr/local/bin/remote-dev-worktree-vars: No such file or directory'* || \
+        $preflight_output == *'/usr/local/bin/remote-dev-worktree-vars: not found'* || \
+        $preflight_output == *'/usr/local/bin/remote-dev-workspace-role: No such file or directory'* || \
+        $preflight_output == *'/usr/local/bin/remote-dev-workspace-role: not found'* ]]; then
+    cat >&2 <<EOF
+Workspace $workspace does not contain the worktree variable helper.
+Run:
+  bin/remote-dev --profile $REMOTE_DEV_PROFILE install
+Then choose Update for $workspace in Coder and retry this command.
+EOF
+    exit 1
+  fi
+  if (( preflight_status != 0 )); then
+    [[ -z $preflight_output ]] || printf '%s\n' "$preflight_output" >&2
+    cat >&2 <<EOF
+Unable to reach worktree variable synchronization in workspace $workspace (exit $preflight_status).
+Recovery Start the workspace in Coder, wait for a healthy agent, and rerun.
+EOF
+    exit "$preflight_status"
+  fi
+
+  local -a coder_args=(
+    /opt/coder ssh --disable-autostart --wait=no "$workspace" --
+    /usr/local/bin/remote-dev-worktree-vars
+    --source-tree "$source_dir"
+    --worktree "$worktree_dir"
+  )
+  [[ $replace == false ]] || coder_args+=(--replace)
+  local coder_command
+  printf -v coder_command ' %q' "${coder_args[@]}"
+  local remote_command
+  remote_command="set -eu; token=\$(tr -d '\\r\\n' < /opt/remote-dev/coder/operator.session); exec docker exec -i -e CODER_URL=http://127.0.0.1:7080 -e CODER_SESSION_TOKEN=\"\$token\" remote-dev-coder-coder-1$coder_command"
+  exec ssh "${ssh_options[@]}" "$host" "$remote_command"
+}
+
+validate_preview_port() {
+  local value=$1
+  local label=$2
+  local output_name=$3
+  if [[ ! $value =~ ^[0-9]{1,5}$ ]]; then
+    printf '%s must be a TCP port from 1 to 65535: %s\n' "$label" "$value" >&2
+    exit 2
+  fi
+  local normalized=$((10#$value))
+  if (( normalized < 1 || normalized > 65535 )); then
+    printf '%s must be a TCP port from 1 to 65535: %s\n' "$label" "$value" >&2
+    exit 2
+  fi
+  printf -v "$output_name" '%d' "$normalized"
+}
+
+run_workspace_preview() {
+  local workspace=${1:-}
+  if [[ -z $workspace ]]; then
+    echo 'preview requires a workspace name and remote HTTP port' >&2
+    exit 2
+  fi
+  if [[ ! $workspace =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'invalid Coder workspace name: %s\n' "$workspace" >&2
+    exit 2
+  fi
+  shift
+
+  local remote_port_value=${1:-}
+  if [[ -z $remote_port_value ]]; then
+    echo 'preview requires a remote HTTP port' >&2
+    exit 2
+  fi
+  shift
+
+  local remote_port
+  validate_preview_port "$remote_port_value" 'remote port' remote_port
+  local local_port=$remote_port
+  while (( $# > 0 )); do
+    case "$1" in
+      --local-port)
+        (( $# >= 2 )) || { echo '--local-port requires a TCP port' >&2; exit 2; }
+        validate_preview_port "$2" 'local port' local_port
+        shift 2
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: remote-dev [--profile <name>] preview <workspace> <remote-port> \
+  [--local-port <port>]
+
+Open an SSH tunnel through the concrete Coder workspace host, verify an HTTP
+response from the remote port, and keep the verified loopback URL available on
+this machine until Ctrl+C.
+EOF
+        exit 0
+        ;;
+      *)
+        printf 'unexpected preview argument: %s\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  for required_command in ssh curl; do
+    command -v "$required_command" >/dev/null 2>&1 || {
+      printf 'preview requires the local command: %s\n' "$required_command" >&2
+      exit 1
+    }
+  done
+
+  local ssh_alias=$REMOTE_DEV_PROFILE.$workspace
+  local local_url=http://127.0.0.1:$local_port
+  local forward=127.0.0.1:$local_port:127.0.0.1:$remote_port
+  local ssh_pid=
+
+  cleanup_preview_tunnel() {
+    if [[ -n ${ssh_pid:-} ]] && kill -0 "$ssh_pid" 2>/dev/null; then
+      kill "$ssh_pid" 2>/dev/null || true
+      wait "$ssh_pid" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_preview_tunnel EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  cat <<EOF
+STARTING Secure preview tunnel to $ssh_alias...
+Remote   http://127.0.0.1:$remote_port
+Local    $local_url
+EOF
+
+  ssh \
+    -N \
+    -o ControlMaster=no \
+    -o ControlPath=none \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -L "$forward" \
+    "$ssh_alias" &
+  ssh_pid=$!
+
+  local http_status=000
+  local curl_status=0
+  local attempt
+  for (( attempt = 0; attempt < 40; attempt++ )); do
+    if ! kill -0 "$ssh_pid" 2>/dev/null; then
+      local ssh_status=0
+      set +e
+      wait "$ssh_pid"
+      ssh_status=$?
+      set -e
+      ssh_pid=
+      trap - EXIT INT TERM
+      cat >&2 <<EOF
+Preview tunnel did not start.
+Recovery:
+  1. If the SSH host is missing, rerun:
+     bin/remote-dev --profile $REMOTE_DEV_PROFILE codex-desktop $workspace
+  2. If local port $local_port is busy, retry with --local-port <free-port>.
+EOF
+      if (( ssh_status == 0 )); then
+        return 1
+      fi
+      return "$ssh_status"
+    fi
+
+    set +e
+    http_status=$(curl \
+      --noproxy 127.0.0.1 \
+      --silent \
+      --output /dev/null \
+      --max-time 1 \
+      --write-out '%{http_code}' \
+      "$local_url" 2>/dev/null)
+    curl_status=$?
+    set -e
+    if [[ $http_status =~ ^[1-5][0-9][0-9]$ ]]; then
+      break
+    fi
+    sleep 0.25
+  done
+
+  if [[ ! $http_status =~ ^[1-5][0-9][0-9]$ ]]; then
+    # A ProxyCommand can stay alive briefly while its Coder API lookup is
+    # failing. Give SSH one final chance to exit so we report a tunnel/control
+    # plane failure instead of incorrectly blaming the remote HTTP service.
+    sleep 1
+    if ! kill -0 "$ssh_pid" 2>/dev/null; then
+      local ssh_status=0
+      set +e
+      wait "$ssh_pid"
+      ssh_status=$?
+      set -e
+      ssh_pid=
+      trap - EXIT INT TERM
+      cat >&2 <<EOF
+Preview tunnel did not start.
+Recovery:
+  1. If the SSH host is missing, rerun:
+     bin/remote-dev --profile $REMOTE_DEV_PROFILE codex-desktop $workspace
+  2. If local port $local_port is busy, retry with --local-port <free-port>.
+EOF
+      if (( ssh_status == 0 )); then
+        return 1
+      fi
+      return "$ssh_status"
+    fi
+
+    if (( curl_status == 7 )); then
+      cat >&2 <<EOF
+Preview tunnel did not become reachable on this Mac.
+Recovery:
+  1. Verify the Coder deployment is reachable, then rerun:
+     bin/remote-dev --profile $REMOTE_DEV_PROFILE codex-desktop $workspace
+  2. If local port $local_port is busy, retry with --local-port <free-port>.
+EOF
+      return 1
+    fi
+
+    cat >&2 <<EOF
+The SSH tunnel started, but the remote app did not return an HTTP response.
+Recovery:
+  1. In the remote workspace, verify http://127.0.0.1:$remote_port.
+  2. Keep the app running and rerun this preview command on the Mac.
+EOF
+    return 1
+  fi
+
+  cat <<EOF
+
+READY    Remote workspace preview is reachable from this Mac.
+Open     $local_url
+HTTP     $http_status
+Stop     Press Ctrl+C in this Terminal.
+Recovery If the tunnel drops, rerun this command; if the local port is busy,
+         add --local-port <free-port> and open the printed URL.
+EOF
+
+  local ssh_status=0
+  set +e
+  wait "$ssh_pid"
+  ssh_status=$?
+  set -e
+  ssh_pid=
+  trap - EXIT INT TERM
+  if (( ssh_status != 0 )); then
+    printf 'Preview tunnel closed unexpectedly (SSH exit %s). Rerun the command.\n' \
+      "$ssh_status" >&2
+  fi
+  return "$ssh_status"
+}
+
+run_workspace_debug_forward() {
+  local workspace=${1:-}
+  if [[ -z $workspace ]]; then
+    echo 'debug-forward requires a runner workspace name and remote TCP port' >&2
+    exit 2
+  fi
+  if [[ ! $workspace =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'invalid Coder workspace name: %s\n' "$workspace" >&2
+    exit 2
+  fi
+  shift
+
+  local remote_port_value=${1:-}
+  if [[ -z $remote_port_value ]]; then
+    echo 'debug-forward requires a remote TCP port' >&2
+    exit 2
+  fi
+  shift
+
+  local remote_port
+  validate_preview_port "$remote_port_value" 'remote port' remote_port
+  local local_port=$remote_port
+  while (( $# > 0 )); do
+    case "$1" in
+      --local-port)
+        (( $# >= 2 )) || { echo '--local-port requires a TCP port' >&2; exit 2; }
+        validate_preview_port "$2" 'local port' local_port
+        shift 2
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: remote-dev [--profile <name>] debug-forward <runner> <remote-port> \
+  [--local-port <port>]
+
+Verify the immutable runner role, open a generic TCP tunnel through its
+concrete Coder SSH host, and keep the Mac-local endpoint available until
+Ctrl+C. This route is for debuggers and other non-HTTP development protocols.
+EOF
+        exit 0
+        ;;
+      *)
+        printf 'unexpected debug-forward argument: %s\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  for required_command in ssh nc; do
+    command -v "$required_command" >/dev/null 2>&1 || {
+      printf 'debug-forward requires the local command: %s\n' "$required_command" >&2
+      exit 1
+    }
+  done
+
+  local ssh_alias=$REMOTE_DEV_PROFILE.$workspace
+  local role_output role_status
+  set +e
+  role_output=$(ssh \
+    -o ControlMaster=no \
+    -o ControlPath=none \
+    "$ssh_alias" \
+    /usr/local/bin/remote-dev-workspace-role require runner 2>&1)
+  role_status=$?
+  set -e
+  if (( role_status != 0 )); then
+    [[ -z $role_output ]] || printf '%s\n' "$role_output" >&2
+    cat >&2 <<EOF
+Unable to verify runner role for $ssh_alias.
+Recovery:
+  1. Verify this is a dedicated runner workspace in Coder.
+  2. Rerun: bin/remote-dev --profile $REMOTE_DEV_PROFILE codex-desktop $workspace
+  3. Start the workspace, wait for a healthy agent, and retry.
+EOF
+    return "$role_status"
+  fi
+
+  local remote_service_command remote_service_output remote_service_status
+  printf -v remote_service_command ' %q' \
+    /usr/bin/env bash -c \
+    'exec 3<>/dev/tcp/127.0.0.1/"$1"' \
+    remote-dev-debug-forward "$remote_port"
+  set +e
+  remote_service_output=$(ssh \
+    -o ControlMaster=no \
+    -o ControlPath=none \
+    "$ssh_alias" \
+    "$remote_service_command" 2>&1)
+  remote_service_status=$?
+  set -e
+  if (( remote_service_status != 0 )); then
+    [[ -z $remote_service_output ]] || printf '%s\n' "$remote_service_output" >&2
+    cat >&2 <<EOF
+The runner debug service is not reachable on 127.0.0.1:$remote_port.
+Recovery Start the debugger on runner loopback, keep it running, and retry.
+EOF
+    return "$remote_service_status"
+  fi
+
+  local endpoint=127.0.0.1:$local_port
+  local forward=$endpoint:127.0.0.1:$remote_port
+  local ssh_pid=
+
+  cleanup_debug_tunnel() {
+    if [[ -n ${ssh_pid:-} ]] && kill -0 "$ssh_pid" 2>/dev/null; then
+      kill "$ssh_pid" 2>/dev/null || true
+      wait "$ssh_pid" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_debug_tunnel EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  cat <<EOF
+STARTING Secure debug tunnel to $ssh_alias...
+Remote   127.0.0.1:$remote_port
+Local    $endpoint
+EOF
+
+  ssh \
+    -N \
+    -o ControlMaster=no \
+    -o ControlPath=none \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -L "$forward" \
+    "$ssh_alias" &
+  ssh_pid=$!
+
+  local attempt reachable=false
+  for (( attempt = 0; attempt < 40; attempt++ )); do
+    if ! kill -0 "$ssh_pid" 2>/dev/null; then
+      local ssh_status=0
+      set +e
+      wait "$ssh_pid"
+      ssh_status=$?
+      set -e
+      ssh_pid=
+      trap - EXIT INT TERM
+      cat >&2 <<EOF
+Debug tunnel did not start.
+Recovery Rerun codex-desktop for $workspace, or choose a free --local-port.
+EOF
+      (( ssh_status != 0 )) || ssh_status=1
+      return "$ssh_status"
+    fi
+    if nc -z -w 1 127.0.0.1 "$local_port" >/dev/null 2>&1; then
+      reachable=true
+      break
+    fi
+    sleep 0.25
+  done
+
+  if [[ $reachable != true ]]; then
+    cat >&2 <<EOF
+The remote service was verified, but the Mac-local forwarding listener did not
+become reachable.
+Recovery Retry with a free --local-port and reconnect to the printed endpoint.
+EOF
+    return 1
+  fi
+
+  cat <<EOF
+
+READY    Verified runner debug service is reachable from this Mac.
+Connect  $endpoint
+Stop     Press Ctrl+C in this Terminal.
+Recovery If the tunnel drops, rerun this command; if the local port is busy,
+         add --local-port <free-port> and use the printed endpoint.
+EOF
+
+  local ssh_status=0
+  set +e
+  wait "$ssh_pid"
+  ssh_status=$?
+  set -e
+  ssh_pid=
+  trap - EXIT INT TERM
+  return "$ssh_status"
+}
+
+local_agent_state_root() {
+  printf '%s\n' "${REMOTE_DEV_LOCAL_AGENT_STATE_ROOT:-$HOME/Library/Application Support/remote-dev/local-agent}"
+}
+
+validate_local_agent_state_root() {
+  local value=$1
+  [[ $value = /* && ${value##*/} == local-agent && $value != / && $value != "$HOME" ]] || {
+    printf 'unsafe local-agent state root: %s\n' "$value" >&2
+    return 1
+  }
+  if [[ -L $value || ( -e $value && ! -d $value ) ]]; then
+    printf 'local-agent state root must be a real directory: %s\n' "$value" >&2
+    return 1
+  fi
+}
+
+run_local_agent_install() {
+  (( $# == 0 )) || { echo 'local-agent install accepts no arguments' >&2; exit 2; }
+  local state_root_value config_path install_state node_path version
+  state_root_value=$(local_agent_state_root)
+  validate_local_agent_state_root "$state_root_value" || exit 1
+  command -v node >/dev/null 2>&1 || { echo 'local-agent install requires Node.js' >&2; exit 1; }
+  command -v mutagen >/dev/null 2>&1 || {
+    echo 'local-agent install requires Mutagen 0.18.1: brew install mutagen-io/mutagen/mutagen' >&2
+    exit 1
+  }
+  version=$(mutagen version 2>/dev/null) || { echo 'unable to verify Mutagen' >&2; exit 1; }
+  [[ $version == 0.18.1 ]] || {
+    printf 'unsupported Mutagen version: %s (required 0.18.1)\n' "$version" >&2
+    exit 1
+  }
+  # Same override as remote-dev-local-agent; the daemon reads it only at start.
+  MUTAGEN_SSH_CONNECT_TIMEOUT=${REMOTE_DEV_LOCAL_AGENT_MUTAGEN_SSH_CONNECT_TIMEOUT_SECONDS:-45} mutagen daemon start
+  node_path=$(node -p 'process.execPath')
+  config_path=${CODEX_HOME:-$HOME/.codex}/config.toml
+  install_state=$state_root_value/mcp-install.json
+  "$repo_root/bin/remote-dev-local-agent-config.mjs" install \
+    --config "$config_path" \
+    --state "$install_state" \
+    --node "$node_path" \
+    --server "$repo_root/bin/remote-dev-local-agent-mcp.mjs"
+  cat <<'EOF'
+READY    Local Agent integration is installed.
+Action   Restart Codex Desktop, open a task inside the bound local Git root,
+         and verify that the MCP inventory contains remote_dev_local_agent.
+Recovery Rerun this command; it is idempotent. Use local-agent uninstall only
+         after local-agent down has stopped every binding.
+EOF
+}
+
+run_local_agent_uninstall() {
+  (( $# == 0 )) || { echo 'local-agent uninstall accepts no arguments' >&2; exit 2; }
+  local state_root_value config_path install_state binding_root runner_root binding binding_dir
+  local root session status_output bound_profile bound_workspace claim expected_claim claim_target
+  local entry verified
+  local -a removable_bindings=()
+  local -a verified_claims=()
+  state_root_value=$(local_agent_state_root)
+  validate_local_agent_state_root "$state_root_value" || exit 1
+  config_path=${CODEX_HOME:-$HOME/.codex}/config.toml
+  install_state=$state_root_value/mcp-install.json
+  binding_root=$state_root_value/bindings/by-root
+  runner_root=$state_root_value/bindings/by-runner
+  if [[ -L $binding_root || ( -e $binding_root && ! -d $binding_root ) ]]; then
+    printf 'invalid local-agent binding root: %s\n' "$binding_root" >&2
+    exit 1
+  fi
+  if [[ -d $binding_root ]]; then
+    command -v mutagen >/dev/null 2>&1 || {
+      echo 'local-agent uninstall cannot verify bindings because Mutagen 0.18.1 is unavailable' >&2
+      exit 1
+    }
+    [[ $(mutagen version 2>/dev/null) == 0.18.1 ]] || {
+      echo 'local-agent uninstall requires Mutagen 0.18.1 to verify bindings' >&2
+      exit 1
+    }
+    MUTAGEN_SSH_CONNECT_TIMEOUT=${REMOTE_DEV_LOCAL_AGENT_MUTAGEN_SSH_CONNECT_TIMEOUT_SECONDS:-45} mutagen daemon start >/dev/null || {
+      echo 'local-agent uninstall cannot start Mutagen to verify sync-session state' >&2
+      exit 1
+    }
+    while IFS= read -r -d '' binding; do
+      binding_dir=${binding%/binding.tsv}
+      case "$binding_dir/" in
+        "$binding_root/"*) ;;
+        *) printf 'binding escapes local-agent state: %s\n' "$binding" >&2; exit 1 ;;
+      esac
+      [[ -f $binding && ! -L $binding ]] || {
+        printf 'binding must be a regular non-symlink file: %s\n' "$binding" >&2
+        exit 1
+      }
+      root=$(awk -F '\t' '$1 == "local_root" { sub(/^[^\t]*\t/, ""); print; exit }' "$binding")
+      session=$(awk -F '\t' '$1 == "mutagen_session" { sub(/^[^\t]*\t/, ""); print; exit }' "$binding")
+      bound_profile=$(awk -F '\t' '$1 == "profile" { sub(/^[^\t]*\t/, ""); print; exit }' "$binding")
+      bound_workspace=$(awk -F '\t' '$1 == "workspace" { sub(/^[^\t]*\t/, ""); print; exit }' "$binding")
+      [[ -n $root && -n $session && -n $bound_profile && -n $bound_workspace ]] || {
+        echo 'binding lacks local_root, mutagen_session, profile, or workspace' >&2
+        exit 1
+      }
+      expected_claim=$runner_root/$bound_profile/$bound_workspace.claim
+      [[ -f $expected_claim && ! -L $expected_claim ]] || {
+        printf 'local-agent uninstall found a missing or invalid reverse claim: %s\n' "$expected_claim" >&2
+        exit 1
+      }
+      IFS= read -r claim_target < "$expected_claim"
+      [[ $claim_target == "$binding_dir" ]] || {
+        printf 'local-agent uninstall found a reverse claim mismatch: %s\n' "$expected_claim" >&2
+        exit 1
+      }
+      if [[ -f $binding_dir/watcher.pid ]]; then
+        printf 'local-agent uninstall is blocked by an active or unreconciled watcher: %s\n' "$root" >&2
+        printf 'Recovery Run local-agent down --for-root %s and retry.\n' "$root" >&2
+        exit 1
+      fi
+      if mutagen sync list "$session" >/dev/null 2>&1; then
+        printf 'local-agent uninstall is blocked by an active sync session: %s\n' "$session" >&2
+        printf 'Recovery Run local-agent down --for-root %s and retry.\n' "$root" >&2
+        exit 1
+      fi
+      if ! status_output=$("$repo_root/bin/remote-dev-local-agent" status --for-root "$root" 2>&1); then
+        printf '%s\n' "$status_output" >&2
+        echo 'local-agent uninstall cannot verify remote managed-process state; start the runner and retry' >&2
+        exit 1
+      fi
+      if [[ $status_output == *'active_process'* || $status_output != *$'lease\tmissing'* ]]; then
+        printf 'local-agent uninstall is blocked by a remote lease or managed process: %s\n' "$root" >&2
+        printf 'Recovery Run local-agent down --for-root %s and retry.\n' "$root" >&2
+        exit 1
+      fi
+      removable_bindings+=("$binding_dir")
+      verified_claims+=("$expected_claim")
+    done < <(find "$binding_root" -mindepth 2 -maxdepth 2 -name binding.tsv -type f -print0)
+  fi
+  if [[ -L $runner_root || ( -e $runner_root && ! -d $runner_root ) ]]; then
+    printf 'invalid local-agent runner-claim root: %s\n' "$runner_root" >&2
+    exit 1
+  fi
+  if [[ -d $runner_root ]]; then
+    while IFS= read -r -d '' entry; do
+      [[ -d $entry && ! -L $entry ]] && continue
+      verified=false
+      for claim in "${verified_claims[@]:-}"; do
+        if [[ -n $claim && $entry == "$claim" ]]; then
+          verified=true
+          break
+        fi
+      done
+      [[ $verified == true ]] || {
+        printf 'local-agent uninstall found unowned reverse-claim state: %s\n' "$entry" >&2
+        exit 1
+      }
+    done < <(find "$runner_root" -mindepth 1 -print0)
+  fi
+  "$repo_root/bin/remote-dev-local-agent-config.mjs" uninstall \
+    --config "$config_path" --state "$install_state"
+  for claim in "${verified_claims[@]:-}"; do
+    if [[ -n $claim ]]; then
+      rm -f -- "$claim"
+      rmdir "${claim%/*}" 2>/dev/null || true
+    fi
+  done
+  for binding_dir in "${removable_bindings[@]:-}"; do
+    [[ -z $binding_dir ]] || rm -rf -- "$binding_dir"
+  done
+  rmdir "$runner_root" "$state_root_value/bindings/by-root" "$state_root_value/bindings" \
+    "$state_root_value" 2>/dev/null || true
+  cat <<'EOF'
+READY    Local Agent integration and verified inactive local bridge state were removed.
+Action   Restart Codex Desktop to unload remote_dev_local_agent.
+Preserved Coder workspaces, runner caches/data, local Git checkouts, and shared SSH configuration.
+EOF
+}
+
+profile_explicit=false
+[[ -z ${REMOTE_DEV_PROFILE:-} ]] || profile_explicit=true
+profile=${REMOTE_DEV_PROFILE:-}
+if [[ "${1:-}" == --profile ]]; then
+  (( $# >= 2 )) || { echo '--profile requires a name' >&2; exit 2; }
+  profile=$2
+  profile_explicit=true
+  shift 2
+fi
+# Help, profile creation and context-bound agent commands work without a
+# selected profile; every other command names its deployment explicitly.
+host=
+case "${1:-}" in
+  profile|install|sysbox-install|secrets|status|audit|doctor|codex|codex-desktop|\
+  codex-update|pids-rollout|workspace|project-setup|worktree-vars|preview|\
+  debug-forward|credentials|token-update|forward)
+    [[ -n $profile ]] || remote_dev_load_profile "$repo_root" '' ;;
+esac
+if [[ -n $profile ]]; then
+  remote_dev_load_profile "$repo_root" "$profile"
+  host=$REMOTE_DEV_SSH_HOST
+fi
+
+command="${1:-}"
+case "$command" in
+  profile)
+    printf 'profile=%s\n' "$REMOTE_DEV_PROFILE"
+    printf 'ingress=%s\n' "$REMOTE_DEV_INGRESS"
+    printf 'egress=%s\n' "$REMOTE_DEV_EGRESS"
+    printf 'expected_hostname=%s\n' "${REMOTE_DEV_EXPECTED_HOSTNAME:-<unset>}"
+    printf 'system_role=%s\n' "${REMOTE_DEV_SYSTEM_ROLE:-<unset>}"
+    printf 'display_name=%s\n' "${REMOTE_DEV_DISPLAY_NAME:-<unset>}"
+    printf 'ssh_host=%s\n' "${REMOTE_DEV_SSH_HOST:-<unset>}"
+    printf 'coder_access_url=%s\n' "${REMOTE_DEV_CODER_ACCESS_URL:-<unset>}"
+    printf 'coolify_access_url=%s\n' "${REMOTE_DEV_COOLIFY_ACCESS_URL:-<unset>}"
+    printf 'coder_host_port=%s\n' "${REMOTE_DEV_CODER_HOST_PORT:-<unset>}"
+    printf 'cloudflare_tunnel_id=%s\n' "${REMOTE_DEV_CLOUDFLARE_TUNNEL_ID:-<unset>}"
+    printf 'cloudflare_hostname=%s\n' "${REMOTE_DEV_CLOUDFLARE_HOSTNAME:-<unset>}"
+    printf 'cloudflare_credentials=%s\n' "${REMOTE_DEV_CLOUDFLARE_CREDENTIALS:-<unset>}"
+    printf 'wireguard_address=%s\n' "${REMOTE_DEV_WIREGUARD_ADDRESS:-<unset>}"
+    printf 'wireguard_config=%s\n' "${REMOTE_DEV_WIREGUARD_CONFIG:-<unset>}"
+    printf 'egress_subnet=%s\n' "${REMOTE_DEV_EGRESS_SUBNET:-<unset>}"
+    ;;
+  secrets)
+    shift
+    exec "$repo_root/bin/remote-dev-secrets" "$@"
+    ;;
+  status)
+    remote 'bash -s' <<'REMOTE'
+set -euo pipefail
+token=$(tr -d '\r\n' < /opt/remote-dev/coder/operator.session)
+
+echo "HOST"
+printf 'hostname=%s uptime=%s load=%s\n' "$(hostname)" "$(uptime -p)" "$(cut -d ' ' -f 1-3 /proc/loadavg)"
+free -h | sed -n '1,3p'
+df -h / | sed -n '1,2p'
+
+echo
+echo "CODER WORKSPACES"
+docker exec \
+  -e CODER_URL=http://127.0.0.1:7080 \
+  -e CODER_SESSION_TOKEN="$token" \
+  remote-dev-coder-coder-1 \
+  /opt/coder list --all \
+  --column workspace \
+  --column template \
+  --column status \
+  --column healthy \
+  --column 'last built' \
+  --column 'stops after'
+
+echo
+echo "CONTAINERS"
+docker stats --no-stream \
+  --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}'
+REMOTE
+    ;;
+  audit)
+    remote 'bash -s' <<'REMOTE'
+set -euo pipefail
+token=$(tr -d '\r\n' < /opt/remote-dev/coder/operator.session)
+workspace_json=$(mktemp)
+trap 'rm -f "$workspace_json"' EXIT
+docker exec \
+  -e CODER_URL=http://127.0.0.1:7080 \
+  -e CODER_SESSION_TOKEN="$token" \
+  remote-dev-coder-coder-1 \
+  /opt/coder list --all --output json > "$workspace_json"
+
+WORKSPACE_JSON="$workspace_json" python3 <<'PY'
+import datetime
+import json
+import os
+
+with open(os.environ["WORKSPACE_JSON"], encoding="utf-8") as stream:
+    workspaces = json.load(stream)
+
+findings = []
+now = datetime.datetime.now(datetime.timezone.utc)
+for workspace in workspaces:
+    build = workspace["latest_build"]
+    name = workspace["name"]
+    status = build["status"]
+    if status == "running" and not workspace["health"]["healthy"]:
+        findings.append(("CRITICAL", name, "running workspace has no healthy agent"))
+    deadline = build.get("deadline")
+    if status == "running" and not deadline:
+        findings.append(("WARN", name, "running workspace has no autostop deadline"))
+    started = datetime.datetime.fromisoformat(build["created_at"].replace("Z", "+00:00"))
+    if status == "running" and now - started > datetime.timedelta(hours=24):
+        findings.append(("WARN", name, "running for more than 24h"))
+
+if findings:
+    for severity, subject, message in findings:
+        print(f"{severity:<8} {subject:<24} {message}")
+else:
+    print("OK       no unhealthy or deadline-free running workspaces")
+PY
+
+available_kib=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+root_used_percent=$(df --output=pcent / | tail -1 | tr -cd '0-9')
+if (( available_kib < 2097152 )); then
+  echo "CRITICAL host                     less than 2 GiB memory available"
+fi
+if (( root_used_percent >= 85 )); then
+  echo "CRITICAL host                     root filesystem is ${root_used_percent}% full"
+elif (( root_used_percent >= 75 )); then
+  echo "WARN     host                     root filesystem is ${root_used_percent}% full"
+fi
+
+managed_containers=$(docker ps -a --filter label=remote-dev.managed=true --format '{{.Names}}' | sort)
+coder_containers=$(docker ps -a --filter name='coder-' --format '{{.Names}}' | grep -v '^remote-dev-coder-' | sort || true)
+if [[ "$managed_containers" != "$coder_containers" ]]; then
+  echo "WARN     docker                   Coder containers and managed labels differ"
+fi
+
+# Host-side Docker inspection still works when the workspace agent cannot fork.
+for container_id in $(docker ps --filter label=remote-dev.managed=true -q); do
+  if ! inspect=$(docker inspect --format '{{.Name}}|{{.HostConfig.PidsLimit}}|{{json .HostConfig.Ulimits}}|{{.State.Pid}}' "$container_id"); then
+    echo "WARN     $container_id disappeared during PID-policy audit"
+    continue
+  fi
+  IFS='|' read -r container_name pids_limit ulimits host_pid <<< "$inspect"
+  if [[ ! "$pids_limit" =~ ^[1-9][0-9]*$ ]]; then
+    echo "WARN     $container_name has no finite Docker PID limit"
+  fi
+  if ! python3 -c 'import json,sys; rows=json.load(sys.stdin) or []; sys.exit(0 if any(row.get("Name")=="nproc" and row.get("Soft")==-1 and row.get("Hard")==-1 for row in rows) else 1)' <<< "$ulimits"; then
+    echo "WARN     $container_name may retain a shared-UID nproc limit"
+  fi
+  [[ -r "/proc/$host_pid/cgroup" ]] || continue
+  cgroup=$(sed -n 's/^0:://p' "/proc/$host_pid/cgroup")
+  if [[ -r "/sys/fs/cgroup$cgroup/pids.events" ]]; then
+    denied=$(awk '$1 == "max" {print $2}' "/sys/fs/cgroup$cgroup/pids.events")
+    if [[ -n "$denied" && "$denied" != 0 ]]; then
+      echo "WARN     $container_name cgroup recorded $denied PID-limit refusals"
+    fi
+  fi
+done
+
+for volume in $(docker volume ls --filter label=coder.workspace_id --format '{{.Name}}'); do
+  workspace_id=$(docker volume inspect "$volume" --format '{{index .Labels "coder.workspace_id"}}')
+  purpose=$(docker volume inspect "$volume" --format '{{index .Labels "remote-dev.purpose"}}')
+  if [[ "$purpose" == "workspace-docker-data" ]]; then
+    continue
+  fi
+  mountpoint=$(docker volume inspect "$volume" --format '{{.Mountpoint}}')
+  if ! grep -q "$workspace_id" "$workspace_json"; then
+    echo "WARN     $volume belongs to an absent Coder workspace; review manually, do not auto-delete"
+  fi
+  profile=$(sudo head -n 1 "$mountpoint/.remote_dev_size" 2>/dev/null || true)
+  case "$profile" in
+    small) budget_bytes=21474836480 ;;
+    standard) budget_bytes=32212254720 ;;
+    large) budget_bytes=42949672960 ;;
+    jetbrains) budget_bytes=53687091200 ;;
+    jetbrains-xl) budget_bytes=64424509440 ;;
+    *)
+      echo "WARN     $volume has no recognized soft disk-budget profile"
+      continue
+      ;;
+  esac
+  used_bytes=$(sudo du -sx --block-size=1 "$mountpoint" | awk '{print $1}')
+  docker_volume="coder-${workspace_id}-docker"
+  if docker volume inspect "$docker_volume" >/dev/null 2>&1; then
+    docker_mountpoint=$(docker volume inspect "$docker_volume" --format '{{.Mountpoint}}')
+    docker_used_bytes=$(sudo du -sx --block-size=1 "$docker_mountpoint" | awk '{print $1}')
+    used_bytes=$((used_bytes + docker_used_bytes))
+  fi
+  if (( used_bytes >= budget_bytes )); then
+    echo "WARN     $volume persistent storage uses $used_bytes bytes; ${profile} soft budget is $budget_bytes"
+  fi
+done
+REMOTE
+    ;;
+  install)
+    "$repo_root/deploy/install.sh"
+    ;;
+  sysbox-install)
+    sysbox_fields=()
+    while IFS= read -r field; do
+      sysbox_fields+=("$field")
+    done < <(remote_dev_identity_fields "$REMOTE_DEV_INGRESS" "$REMOTE_DEV_EGRESS")
+    remote_dev_require_profile_fields sysbox-install "${sysbox_fields[@]}"
+    remote_dev_validate_profile_identity
+    if ! apparmor_state=$(remote 'if [[ ! -f /etc/apparmor.d/fusermount3 ]]; then echo not-required; exit 0; fi; if [[ ! -e /etc/apparmor.d/local/fusermount3 && ! -L /etc/apparmor.d/local/fusermount3 ]]; then echo missing; exit 0; fi; sudo test -f /etc/apparmor.d/local/fusermount3 && sudo test ! -L /etc/apparmor.d/local/fusermount3 && sudo cmp -s /dev/stdin /etc/apparmor.d/local/fusermount3 && echo current' \
+      < "$repo_root/deploy/sysbox/apparmor-local-fusermount3"); then
+      echo 'Refusing to replace an existing non-canonical /etc/apparmor.d/local/fusermount3.' >&2
+      echo 'Merge the Sysbox mount rules explicitly, then retry.' >&2
+      exit 1
+    fi
+    sysbox_active=false
+    if remote 'dpkg-query -W sysbox-ce 2>/dev/null | grep -Eq "^sysbox-ce[[:space:]]+0\\.7\\.1(\\.linux)?$" && systemctl is-active --quiet sysbox-mgr && systemctl is-active --quiet sysbox-fs && docker info --format "{{json .Runtimes}}" | grep -q sysbox-runc'; then
+      sysbox_active=true
+    fi
+    if [[ "$sysbox_active" == true && "$apparmor_state" != missing ]]; then
+      echo 'Sysbox 0.7.1 is already active.'
+      exit 0
+    fi
+    if [[ "$sysbox_active" == true ]]; then
+      scp "${ssh_options[@]}" \
+        "$repo_root/deploy/sysbox/install.sh" \
+        "$host:/tmp/remote-dev-install-sysbox"
+      scp "${ssh_options[@]}" \
+        "$repo_root/deploy/sysbox/apparmor-local-fusermount3" \
+        "$host:/tmp/remote-dev-apparmor-local-fusermount3"
+      remote 'sudo install -d -o root -g root -m 0755 /opt/remote-dev/sysbox && sudo install -o root -g root -m 0755 /tmp/remote-dev-install-sysbox /opt/remote-dev/sysbox/install.sh && sudo install -o root -g root -m 0644 /tmp/remote-dev-apparmor-local-fusermount3 /opt/remote-dev/sysbox/apparmor-local-fusermount3 && rm -f /tmp/remote-dev-install-sysbox /tmp/remote-dev-apparmor-local-fusermount3 && sudo /opt/remote-dev/sysbox/install.sh'
+      echo 'Sysbox 0.7.1 is active and its AppArmor policy is current.'
+      exit 0
+    fi
+    if remote "docker ps --filter label=remote-dev.managed=true --format '{{.Names}}' | grep -q ."; then
+      echo 'Refusing to install Sysbox while a managed workspace is running.' >&2
+      echo 'Stop active Coder workspaces first, then retry.' >&2
+      exit 1
+    fi
+    scp "${ssh_options[@]}" \
+      "$repo_root/deploy/sysbox/install.sh" \
+      "$host:/tmp/remote-dev-install-sysbox"
+    scp "${ssh_options[@]}" \
+      "$repo_root/deploy/sysbox/apparmor-local-fusermount3" \
+      "$host:/tmp/remote-dev-apparmor-local-fusermount3"
+    remote_script 'bash -s --' "$REMOTE_DEV_CODER_HOST_PORT" <<'REMOTE'
+set -euo pipefail
+coder_host_port=$1
+cd /opt/remote-dev/coder
+
+restore_control_plane() {
+  docker compose up -d
+}
+trap restore_control_plane EXIT
+
+sudo install -d -o root -g root -m 0755 /opt/remote-dev/sysbox
+sudo install -o root -g root -m 0755 \
+  /tmp/remote-dev-install-sysbox /opt/remote-dev/sysbox/install.sh
+sudo install -o root -g root -m 0644 \
+  /tmp/remote-dev-apparmor-local-fusermount3 \
+  /opt/remote-dev/sysbox/apparmor-local-fusermount3
+rm -f /tmp/remote-dev-install-sysbox /tmp/remote-dev-apparmor-local-fusermount3
+
+docker compose down
+if [[ -n $(docker ps -aq) ]]; then
+  docker ps -a
+  echo 'Refusing to install Sysbox while non-control-plane containers exist.' >&2
+  exit 1
+fi
+
+sudo /opt/remote-dev/sysbox/install.sh
+restore_control_plane
+trap - EXIT
+
+ready=false
+for _ in $(seq 1 60); do
+  if curl -fsS "http://127.0.0.1:$coder_host_port/api/v2/buildinfo" >/dev/null 2>&1; then
+    ready=true
+    break
+  fi
+  sleep 2
+done
+[[ "$ready" == true ]]
+docker compose exec -T database pg_isready -U coder -d coder >/dev/null
+REMOTE
+    ;;
+  doctor)
+    doctor_fields=()
+    while IFS= read -r field; do
+      doctor_fields+=("$field")
+    done < <(remote_dev_identity_fields "$REMOTE_DEV_INGRESS" "$REMOTE_DEV_EGRESS")
+    [[ $REMOTE_DEV_INGRESS != cloudflare-tunnel ]] || doctor_fields+=(REMOTE_DEV_CLOUDFLARE_CREDENTIALS)
+    [[ $REMOTE_DEV_EGRESS != wireguard ]] || doctor_fields+=(REMOTE_DEV_WIREGUARD_CONFIG)
+    remote_dev_require_profile_fields doctor "${doctor_fields[@]}"
+    remote_dev_validate_profile_values
+    remote_script 'bash -s --' \
+      "$REMOTE_DEV_CODER_ACCESS_URL" \
+      "$REMOTE_DEV_CODER_HOST_PORT" \
+      "$REMOTE_DEV_CLOUDFLARE_TUNNEL_ID" \
+      "$REMOTE_DEV_CLOUDFLARE_HOSTNAME" \
+      "$REMOTE_DEV_WIREGUARD_ADDRESS" \
+      "$REMOTE_DEV_WIREGUARD_INTERFACE" \
+      "$REMOTE_DEV_EGRESS_SUBNET" \
+      "$REMOTE_DEV_EGRESS_GATEWAY" \
+      "$REMOTE_DEV_EGRESS_MTU" \
+      "$REMOTE_DEV_CONTROL_SUBNET" \
+      "$REMOTE_DEV_POLICY_TABLE" \
+      "$REMOTE_DEV_INGRESS" \
+      "$REMOTE_DEV_EGRESS" <<'REMOTE'
+set -euo pipefail
+coder_access_url=$1
+coder_host_port=$2
+cloudflare_tunnel_id=$3
+cloudflare_hostname=$4
+wireguard_address=$5
+wireguard_interface=$6
+egress_subnet=$7
+egress_gateway=$8
+egress_mtu=$9
+control_subnet=${10}
+policy_table=${11}
+ingress=${12}
+egress=${13}
+failures=0
+check() {
+  local label=$1
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf 'OK   %s\n' "$label"
+  else
+    printf 'FAIL %s\n' "$label"
+    failures=$((failures + 1))
+  fi
+}
+
+check 'passwordless sudo' sudo -n true
+check 'Docker daemon' docker info
+verified_workspace_image_id=
+check_workspace_image() {
+  local image source_hash actual_hash
+  source_hash=$(cat /opt/remote-dev/coder/workspace-image.sha256) || return 1
+  [[ $source_hash =~ ^[0-9a-f]{64}$ ]] || return 1
+  image=$(python3 -c '
+import pathlib, re
+text = pathlib.Path("/opt/remote-dev/templates/docker/main.tf").read_text()
+images = re.findall(r"^\s*image\s*=\s*\"(remote-dev-workspace:[^\"]+)\"\s*$", text, re.M)
+if len(images) != 1:
+    raise SystemExit(1)
+print(images[0])
+') || return 1
+  actual_hash=$(docker image inspect --format \
+    '{{index .Config.Labels "id0.remote-dev.workspace-source-sha256"}}' "$image") || return 1
+  [[ $actual_hash == "$source_hash" ]] || return 1
+  verified_workspace_image_id=$(docker image inspect --format '{{.Id}}' "$image")
+}
+check 'pinned workspace image and source hash' check_workspace_image
+check_workspace_image_retention() {
+  local image_id identity
+  image_id=$verified_workspace_image_id
+  [[ $image_id =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  identity=$(docker container inspect --format \
+    '{{.Image}}|{{.State.Status}}|{{index .Config.Labels "id0.remote-dev.purpose"}}' \
+    "remote-dev-image-retention-${image_id#sha256:}") || return 1
+  [[ $identity == "$image_id|created|image-retention" ]]
+}
+check 'workspace image retained across stop' check_workspace_image_retention
+if python3 /opt/remote-dev/coder/workspace-images.py --port "$coder_host_port"; then
+  echo 'OK   images for all existing workspace versions and their active templates'
+else
+  echo 'FAIL workspace image dependency coverage'
+  failures=$((failures + 1))
+fi
+check 'Coder API' curl -fsS "http://127.0.0.1:$coder_host_port/api/v2/buildinfo"
+if [[ $ingress == cloudflare-tunnel ]]; then
+check 'Cloudflare Tunnel enabled' sudo systemctl is-enabled --quiet cloudflared.service
+check 'Cloudflare Tunnel active' sudo systemctl is-active --quiet cloudflared.service
+check 'Cloudflare Tunnel identity' sudo grep -Fxq \
+  "tunnel: $cloudflare_tunnel_id" /etc/cloudflared/config.yml
+check 'Cloudflare Tunnel hostname' sudo grep -Fxq \
+  "  - hostname: $cloudflare_hostname" /etc/cloudflared/config.yml
+check 'Cloudflare Tunnel credentials' sudo test -s \
+  "/etc/cloudflared/$cloudflare_tunnel_id.json"
+else
+  echo 'SKIP Cloudflare Tunnel (ssh-forward ingress publishes nothing)'
+fi
+check 'workspace networks service enabled' sudo systemctl is-enabled --quiet remote-dev-egress.service
+check 'workspace networks service active' sudo systemctl is-active --quiet remote-dev-egress.service
+if [[ $egress == wireguard ]]; then
+check 'WireGuard interface' sudo wg show "$wireguard_interface"
+check 'WireGuard address' bash -c \
+  'ip -4 address show dev "$1" | grep -Fq "inet $2 "' _ \
+  "$wireguard_interface" "$wireguard_address"
+check 'recent WireGuard handshake' bash -c '
+  latest=$(sudo wg show "$1" latest-handshakes | awk '\''{print $2}'\'' | sort -nr | head -1)
+  [[ -n "$latest" && "$latest" -gt 0 && $(($(date +%s) - latest)) -lt 300 ]]
+' _ "$wireguard_interface"
+check 'workspace source policy' bash -c \
+  'ip rule show | grep -Fq "from $1 lookup $2"' _ "$egress_subnet" "$policy_table"
+check 'workspace fail-closed route' bash -c \
+  'ip route show table "$1" | grep -q "^unreachable default"' _ "$policy_table"
+networkd_foreign_setting() {
+  awk -v key="$1" '
+    /^[[:space:]]*\[/ { section = $0; gsub(/[[:space:]]/, "", section); next }
+    section == "[Network]" && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      value = $0
+      sub(/^[^=]*=[[:space:]]*/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      result = tolower(value)
+    }
+    END { print result }'
+}
+check_networkd_keeps_egress_rules() {
+  local config setting value timestamp started files file mtime newest=0
+  config=$(systemd-analyze cat-config systemd/networkd.conf 2>&1) || {
+    echo 'cannot read the effective networkd.conf'
+    return 1
+  }
+  for setting in ManageForeignRoutingPolicyRules ManageForeignRoutes; do
+    value=$(networkd_foreign_setting "$setting" <<<"$config")
+    case $value in
+      no|false|0|off|n|f) ;;
+      *)
+        echo "$setting is not disabled (effective value: ${value:-unset})"
+        return 1
+        ;;
+    esac
+  done
+  if [[ $(systemctl is-active systemd-networkd) != active ]]; then
+    echo 'systemd-networkd is not active'
+    return 1
+  fi
+  timestamp=$(systemctl show systemd-networkd -p ActiveEnterTimestamp --value) || return 1
+  if [[ -z $timestamp ]]; then
+    echo 'systemd-networkd reports no start time'
+    return 1
+  fi
+  started=$(date -d "$timestamp" +%s) || {
+    echo "cannot read the systemd-networkd start time: $timestamp"
+    return 1
+  }
+  files=$(sed -nE 's|^# (/[^[:space:]]+)$|\1|p' <<<"$config")
+  while IFS= read -r file; do
+    [[ -n $file ]] || continue
+    mtime=$(stat -L -c %Y -- "$file") || {
+      echo "cannot stat $file"
+      return 1
+    }
+    if ((mtime > newest)); then
+      newest=$mtime
+    fi
+  done <<<"$files"
+  if ((newest == 0)); then
+    echo 'no networkd configuration file found'
+    return 1
+  fi
+  if ((started < newest)); then
+    echo 'systemd-networkd started before its last configuration change; restart it to load the change'
+    return 1
+  fi
+}
+if networkd_reason=$(check_networkd_keeps_egress_rules 2>&1); then
+  echo 'OK   networkd keeps workspace egress rules across restarts'
+else
+  echo "FAIL networkd keeps workspace egress rules across restarts: $networkd_reason"
+  failures=$((failures + 1))
+fi
+else
+  echo 'SKIP WireGuard egress (host egress uses the host default route)'
+fi
+control_gateway=$(python3 -c \
+  'import ipaddress,sys; print(next(ipaddress.ip_network(sys.argv[1]).hosts()))' \
+  "$control_subnet")
+check_network_contract() {
+  local name=$1 subnet=$2 gateway=$3 internal=$4 mtu=$5 attached=$6
+  docker network inspect "$name" | python3 -c '
+import ipaddress
+import json
+import sys
+
+name, expected_subnet, expected_gateway, expected_internal, expected_mtu, attached = sys.argv[1:]
+payload = json.load(sys.stdin)
+if not isinstance(payload, list) or len(payload) != 1:
+    raise SystemExit(1)
+network = payload[0]
+configs = network.get("IPAM", {}).get("Config", [])
+ipv4 = [item for item in configs if isinstance(item, dict) and ":" not in item.get("Subnet", "")]
+actual_mtu = network.get("Options", {}).get("com.docker.network.driver.mtu", "")
+expected_mtu = "" if expected_mtu == "-" else expected_mtu
+containers = {
+    item.get("Name") for item in network.get("Containers", {}).values()
+    if isinstance(item, dict)
+}
+valid = (
+    network.get("Name") == name
+    and network.get("Driver") == "bridge"
+    and network.get("Internal") is (expected_internal == "true")
+    and len(ipv4) == 1
+    and ipaddress.ip_network(ipv4[0].get("Subnet", ""), strict=True)
+        == ipaddress.ip_network(expected_subnet, strict=True)
+    and ipv4[0].get("Gateway") == expected_gateway
+    and actual_mtu == expected_mtu
+    and (attached == "-" or attached in containers)
+)
+raise SystemExit(0 if valid else 1)
+' "$name" "$subnet" "$gateway" "$internal" "$mtu" "$attached"
+}
+check 'workspace egress network contract' check_network_contract \
+  remote-dev-egress "$egress_subnet" "$egress_gateway" false "$egress_mtu" -
+check 'Coder control network contract' check_network_contract \
+  remote-dev-control "$control_subnet" "$control_gateway" true - \
+  remote-dev-coder-coder-1
+if [[ $egress == wireguard ]]; then
+  check 'Docker egress policy chain' bash -c \
+    'sudo iptables -C DOCKER-USER -j REMOTE-DEV-EGRESS'
+fi
+if [[ $ingress == cloudflare-tunnel ]]; then
+  check 'owned HTTPS Coder API' bash -c '
+    response=$(curl -fsS --max-time 20 "$1/api/v2/buildinfo") &&
+    python3 -c '\''import json,sys; data=json.load(sys.stdin); raise SystemExit(data.get("dashboard_url") != sys.argv[1])'\'' "$1" <<<"$response"
+  ' _ "$coder_access_url"
+else
+  # The access URL is the Mac end of the SSH forward; verify Coder advertises it.
+  check 'Coder access URL matches the SSH forward' bash -c '
+    response=$(curl -fsS --max-time 20 "http://127.0.0.1:$2/api/v2/buildinfo") &&
+    python3 -c '\''import json,sys; data=json.load(sys.stdin); raise SystemExit(data.get("dashboard_url") != sys.argv[1])'\'' "$1" <<<"$response"
+  ' _ "$coder_access_url" "$coder_host_port"
+fi
+check 'PostgreSQL healthy' docker exec remote-dev-coder-database-1 pg_isready -U coder -d coder
+if [[ -s /opt/remote-dev/coder/operator.session ]]; then
+  operator_token=$(tr -d '\r\n' < /opt/remote-dev/coder/operator.session)
+  check 'Coder operator session' docker exec \
+    -e CODER_URL=http://127.0.0.1:7080 \
+    -e CODER_SESSION_TOKEN="$operator_token" \
+    remote-dev-coder-coder-1 /opt/coder whoami
+  check 'GitHub External Auth provider' docker exec \
+    -e CODER_SESSION_TOKEN="$operator_token" \
+    remote-dev-coder-coder-1 sh -c \
+    'curl -fsS -H "Coder-Session-Token: $CODER_SESSION_TOKEN" \
+      http://127.0.0.1:7080/api/v2/external-auth/github'
+else
+  echo 'FAIL Coder operator session is missing'
+  failures=$((failures + 1))
+fi
+
+running_workspaces=$(docker ps --filter label=remote-dev.managed=true --format '{{.Names}}')
+if [[ $egress == host ]]; then
+  echo 'SKIP workspace VPN egress (host egress by profile)'
+elif [[ -n "$running_workspaces" ]]; then
+  ipv4_pattern='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+  host_ip=$(curl -4 -fsS --max-time 15 https://api.ipify.org || true)
+  probe_workspace_egress() {
+    printf '%s %s\n' "$1" \
+      "$(docker exec "$1" curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  }
+  export -f probe_workspace_egress
+  workspace_egress=$(printf '%s\n' "$running_workspaces" |
+    xargs -P 8 -I{} bash -c 'probe_workspace_egress "$1"' _ {})
+  failed_workspaces=()
+  exit_ips=()
+  while read -r running_workspace workspace_ip; do
+    if [[ $workspace_ip =~ $ipv4_pattern && $workspace_ip != "$host_ip" ]]; then
+      exit_ips+=("$workspace_ip")
+    else
+      failed_workspaces+=("$running_workspace")
+    fi
+  done <<<"$workspace_egress"
+  if [[ ! $host_ip =~ $ipv4_pattern ]]; then
+    echo 'FAIL workspace VPN egress cannot be judged: the host address probe failed'
+    failures=$((failures + 1))
+  elif ((${#failed_workspaces[@]} > 0)); then
+    echo "FAIL workspace VPN egress is unavailable or leaks through host: ${failed_workspaces[*]}"
+    failures=$((failures + 1))
+  else
+    echo "OK   all ${#exit_ips[@]} running workspaces use a VPN egress distinct from the host ($(printf '%s\n' "${exit_ips[@]}" | sort -u | paste -sd, -))"
+  fi
+else
+  echo 'SKIP workspace VPN egress (no running managed workspace)'
+fi
+
+sshd_effective=$(sudo sshd -T)
+sshd_expected=(
+  'permitrootlogin no'
+  'passwordauthentication no'
+  'kbdinteractiveauthentication no'
+  'pubkeyauthentication yes'
+  'allowusers dev'
+  'maxauthtries 3'
+)
+sshd_failures=0
+for expected in "${sshd_expected[@]}"; do
+  if ! grep -qx "$expected" <<<"$sshd_effective"; then
+    echo "FAIL effective sshd policy missing: $expected"
+    sshd_failures=$((sshd_failures + 1))
+  fi
+done
+if (( sshd_failures == 0 )); then
+  echo 'OK   effective sshd authentication policy hardened'
+else
+  failures=$((failures + sshd_failures))
+fi
+
+ufw_status=$(sudo ufw status verbose)
+if grep -qx 'Status: active' <<<"$ufw_status"; then
+  echo 'OK   UFW active'
+else
+  echo 'FAIL UFW is not active'
+  failures=$((failures + 1))
+fi
+if grep -q '^Default: deny (incoming),' <<<"$ufw_status"; then
+  echo 'OK   UFW default denies inbound'
+else
+  echo 'FAIL UFW default inbound policy is not deny'
+  failures=$((failures + 1))
+fi
+ufw_allows=$(awk '$2 == "ALLOW" || $3 == "ALLOW" {print $1}' <<<"$ufw_status" | sort -u)
+if [[ "$ufw_allows" == '22/tcp' ]]; then
+  echo 'OK   UFW allows only SSH inbound'
+else
+  echo "FAIL unexpected UFW allow rules: $ufw_allows"
+  failures=$((failures + 1))
+fi
+
+classify_public_endpoints() {
+  python3 -c '
+import ipaddress
+import sys
+
+for endpoint in sys.stdin:
+    endpoint = endpoint.strip()
+    host, _, port = endpoint.rpartition(":")
+    host = host.strip("[]").split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        continue
+    if address.is_unspecified:
+        print(f"{host}:{port}")
+        continue
+    if address.is_loopback or address.is_private:
+        continue
+    print(f"{host}:{port}")
+' 
+}
+
+coolify_proxy_verified=$({
+  sudo docker inspect coolify-proxy 2>/dev/null || printf '%s\n' '[]'
+} | python3 -c '
+import json, sys
+try:
+    containers = json.load(sys.stdin)
+    container = containers[0]
+    labels = container["Config"]["Labels"]
+    bindings = container["HostConfig"]["PortBindings"]
+    networks = container["NetworkSettings"]["Networks"]
+    expected = {"80/tcp": "80", "443/tcp": "443", "443/udp": "443"}
+    actual = {
+        port: entries[0].get("HostPort")
+        for port, entries in bindings.items()
+        if isinstance(entries, list) and len(entries) == 1
+    }
+    valid = (
+        len(containers) == 1
+        and container["State"]["Running"] is True
+        and container["State"].get("Health", {}).get("Status") == "healthy"
+        and labels.get("coolify.managed") == "true"
+        and labels.get("coolify.proxy") == "true"
+        and labels.get("com.docker.compose.project") == "coolify-proxy"
+        and labels.get("com.docker.compose.service") == "traefik"
+        and "coolify" in networks
+        and not ({"remote-dev-control", "remote-dev-egress"} & set(networks))
+        and not any(name.startswith("coder-") or name.startswith("remote-dev-") for name in networks)
+        and actual == expected
+    )
+    print("true" if valid else "false")
+except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+    print("false")
+')
+public_listeners=$(sudo ss -H -lnt | awk '{print $4}' | classify_public_endpoints | sort -u)
+if [[ "$coolify_proxy_verified" == 'true' ]]; then
+  expected_public_tcp=$(printf '%s\n' \
+    '0.0.0.0:22' '0.0.0.0:80' '0.0.0.0:443' \
+    ':::22' ':::80' ':::443' | sort -u)
+  expected_public_tcp_message='SSH and the Coolify proxy own wildcard TCP listeners'
+else
+  expected_public_tcp=$(printf '%s\n' '0.0.0.0:22' ':::22' | sort -u)
+  expected_public_tcp_message='only SSH listens on wildcard addresses'
+fi
+if [[ "$public_listeners" == "$expected_public_tcp" ]]; then
+  echo "OK   $expected_public_tcp_message"
+else
+  echo "FAIL unexpected public TCP listeners: $public_listeners"
+  failures=$((failures + 1))
+fi
+
+public_udp=$(sudo ss -H -lnu | awk '{print $4}' | classify_public_endpoints | sort -u)
+wireguard_port=$(sudo wg show "$wireguard_interface" listen-port 2>/dev/null || true)
+expected_public_udp=()
+if [[ -n "$wireguard_port" ]]; then
+  expected_public_udp+=("0.0.0.0:$wireguard_port" ":::$wireguard_port")
+fi
+if [[ "$coolify_proxy_verified" == 'true' ]]; then
+  expected_public_udp+=('0.0.0.0:443' ':::443')
+fi
+expected_public_udp_value=$(printf '%s\n' "${expected_public_udp[@]}" | sed '/^$/d' | sort -u)
+if [[ "$public_udp" == "$expected_public_udp_value" ]]; then
+  if [[ "$coolify_proxy_verified" == 'true' ]]; then
+    echo 'OK   only Coolify HTTP/3 and WireGuard use wildcard UDP'
+  elif [[ -n "$wireguard_port" ]]; then
+    echo 'OK   only WireGuard client socket uses wildcard UDP'
+  else
+    echo 'OK   no public UDP listeners'
+  fi
+else
+  echo "FAIL unexpected public UDP listeners: $public_udp"
+  failures=$((failures + 1))
+fi
+
+exit "$failures"
+REMOTE
+    ;;
+  codex)
+    shift
+    run_workspace_codex "$@"
+    ;;
+  codex-desktop)
+    shift
+    exec "$repo_root/bin/remote-dev-codex-desktop" \
+      --profile "$REMOTE_DEV_PROFILE" \
+      --coder-url "$REMOTE_DEV_CODER_ACCESS_URL" \
+      "$@"
+    ;;
+  codex-update)
+    shift
+    exec python3 -B "$repo_root/bin/remote-dev-codex-update.py" --profile "$REMOTE_DEV_PROFILE" "$@"
+    ;;
+  pids-rollout)
+    shift
+    workspace=${1:-}
+    [[ $workspace =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+      echo 'pids-rollout requires one workspace name' >&2
+      exit 2
+    }
+    shift
+    printf -v rollout_command '%q ' sudo python3 - --workspace "$workspace" \
+      --coder-url "$REMOTE_DEV_CODER_ACCESS_URL" --port "$REMOTE_DEV_CODER_HOST_PORT" "$@"
+    exec ssh "${ssh_options[@]}" "$host" "$rollout_command" < "$repo_root/deploy/pids-rollout.py"
+    ;;
+  workspace)
+    shift
+    exec "$repo_root/bin/remote-dev-workspace" \
+      --profile "$REMOTE_DEV_PROFILE" \
+      --coder-url "$REMOTE_DEV_CODER_ACCESS_URL" \
+      "$@"
+    ;;
+  local-agent)
+    shift
+    case "${1:-}" in
+      install)
+        shift
+        run_local_agent_install "$@"
+        ;;
+      uninstall)
+        shift
+        run_local_agent_uninstall "$@"
+        ;;
+      '')
+        "$repo_root/bin/remote-dev-local-agent" --help >&2
+        exit 2
+        ;;
+      *)
+        local_agent_context_bound=false
+        for local_agent_argument in "$@"; do
+          case "$local_agent_argument" in
+            --for-context|--for-root) local_agent_context_bound=true ;;
+          esac
+        done
+        if [[ $profile_explicit == true || $local_agent_context_bound == false ]]; then
+          [[ -n $profile ]] || remote_dev_load_profile "$repo_root" ''
+          exec "$repo_root/bin/remote-dev-local-agent" \
+            --profile "$REMOTE_DEV_PROFILE" \
+            --coder-url "$REMOTE_DEV_CODER_ACCESS_URL" \
+            "$@"
+        fi
+        exec "$repo_root/bin/remote-dev-local-agent" "$@"
+        ;;
+    esac
+    ;;
+  mode)
+    shift
+    if [[ $profile_explicit == true ]]; then
+      exec python3 "$repo_root/bin/remote-dev-mode" \
+        --profile "$REMOTE_DEV_PROFILE" --coder-url "$REMOTE_DEV_CODER_ACCESS_URL" "$@"
+    fi
+    exec python3 "$repo_root/bin/remote-dev-mode" "$@"
+    ;;
+  project-setup)
+    shift
+    run_project_setup "$@"
+    ;;
+  worktree-vars)
+    shift
+    run_worktree_vars "$@"
+    ;;
+  preview)
+    shift
+    run_workspace_preview "$@"
+    ;;
+  debug-forward)
+    shift
+    run_workspace_debug_forward "$@"
+    ;;
+  credentials)
+    shift
+    exec "$repo_root/bin/remote-dev-credentials" "$@"
+    ;;
+  token-update)
+    token=$(tr -d '\r\n')
+    if [[ -z "$token" ]]; then
+      echo 'token-update requires a Coder session token on stdin' >&2
+      exit 2
+    fi
+    printf '%s\n' "$token" | remote 'umask 077; temp=$(mktemp); trap '\''rm -f "$temp"'\'' EXIT; cat > "$temp"; install -m 0600 "$temp" /opt/remote-dev/coder/operator.session'
+    echo 'operator session updated'
+    ;;
+  forward)
+    if [[ $REMOTE_DEV_INGRESS == ssh-forward ]]; then
+      local_port=${REMOTE_DEV_CODER_ACCESS_URL##*:}
+      printf 'Forwarding %s to Coder on %s; keep this command running.\n' \
+        "$REMOTE_DEV_CODER_ACCESS_URL" "$REMOTE_DEV_PROFILE"
+      exec ssh -o ControlMaster=no -o ControlPath=none -o ExitOnForwardFailure=yes -N \
+        -L "127.0.0.1:$local_port:127.0.0.1:$REMOTE_DEV_CODER_HOST_PORT" "$host"
+    fi
+    exec ssh -N "$host"
+    ;;
+  init|quickstart)
+    exec "$repo_root/bin/remote-dev-quickstart" "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

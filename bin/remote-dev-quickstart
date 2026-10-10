@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck disable=SC1091
+. "$repo_root/deploy/host-profiles/load.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  remote-dev init <profile> --ssh-host <alias> [--local-port <port>] [--host-port <port>]
+      [--egress-subnet <cidr> --egress-gateway <ip> --control-subnet <cidr>]
+  remote-dev quickstart <profile> --ssh <user>@<server> [--admin-key <private-key>]
+      [--key <private-key>]
+      [--local-port <port>] [--host-port <port>]
+
+init writes deploy/host-profiles/<profile>.env for the minimal topology:
+ssh-forward ingress (nothing is published) and host egress.
+
+quickstart prepares a fresh Ubuntu 24.04 or 26.04 server end to end: it
+bootstraps the host through the given administrative SSH login, adds an SSH
+alias for the dev user, creates the profile, installs Coder and the workspace
+template, runs doctor, and prints how to open the dashboard.
+EOF
+}
+
+fail() {
+  printf 'ERROR    %s\n' "$*" >&2
+  exit 1
+}
+
+step() {
+  printf '\n==> %s\n' "$*"
+}
+
+valid_port() {
+  [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1024 && $1 <= 65535 ))
+}
+
+write_profile() {
+  local profile=$1 ssh_host=$2 local_port=$3 host_port=$4
+  local egress_subnet=$5 egress_gateway=$6 control_subnet=$7
+  local profile_dir profile_file temp
+  profile_dir=$(remote_dev_profile_dir "$repo_root")
+  profile_file=$profile_dir/$profile.env
+  if [[ -e $profile_file || -L $profile_file ]]; then
+    fail "profile already exists: $profile_file"
+  fi
+  mkdir -p "$profile_dir"
+  temp=$(mktemp "$profile_dir/.$profile.XXXXXX")
+  cat > "$temp" <<EOF
+# Host profile created by remote-dev init. It holds no secrets.
+# Minimal topology: Coder stays on server loopback and is reached through
+# 'remote-dev --profile $profile forward'; workspaces use the host's route.
+REMOTE_DEV_PROFILE_NAME=$profile
+REMOTE_DEV_PROFILE_INGRESS=ssh-forward
+REMOTE_DEV_PROFILE_EGRESS=host
+REMOTE_DEV_PROFILE_SSH_HOST=$ssh_host
+REMOTE_DEV_PROFILE_CODER_ACCESS_URL=http://127.0.0.1:$local_port
+REMOTE_DEV_PROFILE_CODER_HOST_PORT=$host_port
+REMOTE_DEV_PROFILE_EGRESS_SUBNET=$egress_subnet
+REMOTE_DEV_PROFILE_EGRESS_GATEWAY=$egress_gateway
+REMOTE_DEV_PROFILE_EGRESS_MTU=1420
+REMOTE_DEV_PROFILE_CONTROL_SUBNET=$control_subnet
+EOF
+  chmod 0644 "$temp"
+  mv "$temp" "$profile_file"
+  # A separate shell keeps errexit active inside the profile loader.
+  if ! REMOTE_DEV_PROFILE_DIR=$profile_dir bash -c '
+    set -euo pipefail
+    . "$1/deploy/host-profiles/load.sh"
+    remote_dev_load_profile "$1" "$2"
+    remote_dev_validate_profile_values
+  ' _ "$repo_root" "$profile"; then
+    rm -f "$profile_file"
+    fail "generated profile did not validate; adjust the flags and retry"
+  fi
+  printf 'Profile  %s\n' "$profile_file"
+}
+
+parse_common() {
+  local_port=3080
+  host_port=3080
+  egress_subnet=10.250.10.0/24
+  egress_gateway=10.250.10.1
+  control_subnet=10.250.11.0/24
+  ssh_host=
+  ssh_login=
+  key=$HOME/.ssh/remote-dev
+  admin_key=
+  while (( $# > 0 )); do
+    case $1 in
+      --ssh-host) ssh_host=${2:-}; shift 2 ;;
+      --ssh) ssh_login=${2:-}; shift 2 ;;
+      --key) key=${2:-}; shift 2 ;;
+      --admin-key) admin_key=${2:-}; shift 2 ;;
+      --local-port) local_port=${2:-}; shift 2 ;;
+      --host-port) host_port=${2:-}; shift 2 ;;
+      --egress-subnet) egress_subnet=${2:-}; shift 2 ;;
+      --egress-gateway) egress_gateway=${2:-}; shift 2 ;;
+      --control-subnet) control_subnet=${2:-}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; exit 2 ;;
+    esac
+  done
+  valid_port "$local_port" || fail '--local-port must be between 1024 and 65535'
+  valid_port "$host_port" || fail '--host-port must be between 1024 and 65535'
+}
+
+ensure_ssh_alias() {
+  local profile=$1 address=$2 key=$3
+  local ssh_dir=$HOME/.ssh ssh_config fragment include_line temp
+  ssh_config=$ssh_dir/config
+  fragment=$ssh_dir/remote-dev-server-$profile.conf
+  include_line="Include \"$fragment\""
+  mkdir -p "$ssh_dir"
+  chmod 0700 "$ssh_dir"
+  if [[ -L $ssh_config || ( -e $ssh_config && ! -f $ssh_config ) || \
+        -L $fragment || ( -e $fragment && ! -f $fragment ) ]]; then
+    fail 'refusing non-regular SSH configuration state'
+  fi
+  temp=$(mktemp "$ssh_dir/.remote-dev-server.XXXXXX")
+  cat > "$temp" <<EOF
+# Written by remote-dev quickstart for profile $profile.
+Host $profile
+  HostName $address
+  User dev
+  IdentityFile $key
+  IdentitiesOnly yes
+  ServerAliveInterval 30
+EOF
+  chmod 0600 "$temp"
+  mv "$temp" "$fragment"
+  [[ -e $ssh_config ]] || { : > "$ssh_config"; chmod 0600 "$ssh_config"; }
+  if ! grep -Fxq "$include_line" "$ssh_config"; then
+    # Include is global only before the first Host or Match block.
+    temp=$(mktemp "$ssh_dir/.remote-dev-ssh.XXXXXX")
+    awk -v include_line="$include_line" '
+      BEGIN { inserted = 0 }
+      !inserted && /^[[:space:]]*(Host|Match)[[:space:]]/ {
+        print include_line; print ""; inserted = 1
+      }
+      { print }
+      END { if (!inserted) print include_line }
+    ' "$ssh_config" > "$temp"
+    chmod 0600 "$temp"
+    mv "$temp" "$ssh_config"
+  fi
+  printf 'SSH      alias %s -> dev@%s (%s)\n' "$profile" "$address" "$fragment"
+}
+
+run_init() {
+  local profile=${1:-}
+  [[ -n $profile && $profile != -* ]] || { usage >&2; exit 2; }
+  shift
+  parse_common "$@"
+  [[ -n $ssh_host ]] || fail 'init requires --ssh-host <alias>'
+  write_profile "$profile" "$ssh_host" "$local_port" "$host_port" \
+    "$egress_subnet" "$egress_gateway" "$control_subnet"
+}
+
+run_quickstart() {
+  local profile=${1:-}
+  [[ -n $profile && $profile != -* ]] || { usage >&2; exit 2; }
+  shift
+  [[ $profile =~ ^[a-z0-9][a-z0-9-]*$ ]] || fail "invalid profile name: $profile"
+  parse_common "$@"
+  [[ $ssh_login =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.:-]+$ ]] || \
+    fail 'quickstart requires --ssh <user>@<server> for the first administrative login'
+  local address=${ssh_login#*@} control_dir control public_key profile_file
+  for tool in ssh ssh-keygen python3; do
+    command -v "$tool" >/dev/null || fail "missing required tool: $tool"
+  done
+  profile_file=$(remote_dev_profile_dir "$repo_root")/$profile.env
+
+  step "Operator key"
+  if [[ ! -f $key ]]; then
+    mkdir -p "$(dirname "$key")"
+    ssh-keygen -q -t ed25519 -N '' -C "remote-dev-$profile" -f "$key"
+    printf 'Created  %s (no passphrase; add one with ssh-keygen -p -f %s)\n' "$key" "$key"
+  else
+    printf 'Using    %s\n' "$key"
+  fi
+  public_key=$(<"$key.pub")
+
+  step "Host bootstrap"
+  if ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 \
+       -o StrictHostKeyChecking=accept-new "dev@$address" 'sudo -n true' >/dev/null 2>&1; then
+    printf 'Skipped  dev@%s already works with this key\n' "$address"
+  else
+    # Keep one administrative connection open: the bootstrap disables root
+    # and password logins, and this session survives the sshd reload so a
+    # failed dev login can still be repaired.
+    local -a admin_options=()
+    [[ -z $admin_key ]] || admin_options=(-i "$admin_key" -o IdentitiesOnly=yes)
+    control_dir=$(mktemp -d "${TMPDIR:-/tmp}/remote-dev-quickstart.XXXXXX")
+    control=$control_dir/admin
+    ssh "${admin_options[@]+"${admin_options[@]}"}" \
+      -o ControlMaster=yes -o ControlPath="$control" -o ControlPersist=900 \
+      -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -fN "$ssh_login" || \
+      fail "cannot open the administrative SSH login $ssh_login"
+    ssh -o ControlPath="$control" "$ssh_login" \
+      "sudo REMOTE_DEV_PUBLIC_KEY=$(printf '%q' "$public_key") bash -s" \
+      < "$repo_root/bootstrap/ubuntu.sh"
+    if ! ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 \
+         "dev@$address" 'sudo -n true && docker info >/dev/null'; then
+      printf 'ERROR    dev@%s does not work after bootstrap.\n' "$address" >&2
+      printf 'The administrative session stays open for 15 minutes: ssh -o ControlPath=%q %s\n' \
+        "$control" "$ssh_login" >&2
+      exit 1
+    fi
+    ssh -o ControlPath="$control" -O exit "$ssh_login" >/dev/null 2>&1 || true
+    rm -rf "$control_dir"
+    printf 'Verified dev@%s with passwordless sudo and Docker\n' "$address"
+  fi
+
+  step "SSH alias and profile"
+  ensure_ssh_alias "$profile" "$address" "$key"
+  if [[ -f $profile_file ]]; then
+    printf 'Using    existing %s\n' "$profile_file"
+  else
+    write_profile "$profile" "$profile" "$local_port" "$host_port" \
+      "$egress_subnet" "$egress_gateway" "$control_subnet"
+  fi
+
+  step "Install Coder and the workspace template"
+  REMOTE_DEV_PROFILE=$profile "$repo_root/deploy/install.sh"
+
+  step "Doctor"
+  local doctor_status=0
+  "$repo_root/bin/remote-dev" --profile "$profile" doctor || doctor_status=$?
+
+  step "Next steps"
+  cat <<EOF
+1. Keep the dashboard forwarded (leave it running):
+     bin/remote-dev --profile $profile forward
+2. Open http://127.0.0.1:$local_port in your browser.
+3. Get the first owner login (shown once, then store it in a password manager):
+     bin/remote-dev --profile $profile credentials reveal coder --confirm-profile $profile
+4. Create a workspace from the 'remote-dev-docker' template in the dashboard, or:
+     bin/remote-dev --profile $profile workspace --help
+EOF
+  if (( doctor_status != 0 )); then
+    printf '\nDoctor reported %s failing check(s); see the FAIL lines above.\n' "$doctor_status" >&2
+    exit 1
+  fi
+}
+
+command=${1:-}
+shift || true
+case $command in
+  init) run_init "$@" ;;
+  quickstart) run_quickstart "$@" ;;
+  -h|--help|help|'') usage ;;
+  *) usage >&2; exit 2 ;;
+esac

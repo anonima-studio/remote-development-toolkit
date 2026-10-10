@@ -1,0 +1,14 @@
+# Dependencies and local tooling state
+node_modules/
+.pnpm-store/
+.DS_Store
+
+# Host profiles are local operator files; only the example is tracked.
+deploy/host-profiles/*.env
+!deploy/host-profiles/example.env
+
+# Secrets that must never enter Git
+deploy/coder/.env
+backup/restic.env
+deploy/cloudflared/*.json
+deploy/wireguard/*.conf

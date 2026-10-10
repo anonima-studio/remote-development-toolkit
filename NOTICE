@@ -1,0 +1,9 @@
+Remote development toolkit
+Copyright 2026 Yury Telitsin
+Published by Anonima Studio
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The toolkit installs, pins or builds upon third-party software that is
+licensed separately by its authors. See THIRD_PARTY.md for the list of
+components and their licenses.

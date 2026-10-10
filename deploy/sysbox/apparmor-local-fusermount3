@@ -1,0 +1,4 @@
+# Ubuntu 26.04 confines fusermount3. Sysbox mounts one FUSE filesystem per
+# system container under this dedicated data root.
+mount fstype=@{fuse_types} options=(nosuid,nodev) options in (ro,rw,noatime,dirsync,nodiratime,noexec,sync) -> /var/lib/sysboxfs/**/,
+umount /var/lib/sysboxfs/**/,

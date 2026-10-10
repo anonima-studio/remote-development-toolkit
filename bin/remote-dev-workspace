@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: remote-dev-workspace --profile <name> --coder-url <url> \
+  create <workspace> --role <development|runner> \
+  --capability <core|containers> --size <size> [--template-version <name>]
+  remote-dev-workspace --profile <name> --coder-url <url> \
+  start <workspace>
+  remote-dev-workspace --profile <name> --coder-url <url> inspect <workspace>
+  remote-dev-workspace --profile <name> --coder-url <url> \
+  update <workspace> --expect-codex <version> <--check|--restart>
+
+Create or start a workspace through the selected Coder deployment, wait for its
+agent, and verify the immutable Remote Dev workspace-role marker.
+An explicit template version disables automatic updates for the new workspace.
+Inspect returns read-only JSON and never logs in or starts the workspace.
+Update applies the published active template to a running development workspace.
+--check only probes Codex; --restart interrupts all workspace processes.
+EOF
+}
+
+profile=
+coder_url=
+while (( $# > 0 )); do
+  case "$1" in
+    --profile)
+      (( $# >= 2 )) || { echo '--profile requires a name' >&2; exit 2; }
+      profile=$2
+      shift 2
+      ;;
+    --coder-url)
+      (( $# >= 2 )) || { echo '--coder-url requires a URL' >&2; exit 2; }
+      coder_url=$2
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+[[ $profile =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
+  printf 'invalid profile name: %s\n' "$profile" >&2
+  exit 2
+}
+# HTTPS for a published Coder, or the Mac end of an SSH forward.
+[[ $coder_url == https://* || $coder_url =~ ^http://127\.0\.0\.1:[0-9]+$ ]] || {
+  printf 'workspace command requires an HTTPS or SSH-forward Coder URL: %s\n' "$coder_url" >&2
+  exit 2
+}
+
+command=${1:-}
+if [[ $command == inspect ]]; then
+  exec python3 -B "$(dirname "$0")/remote-dev-workspace-plan.py" \
+    --profile "$profile" --coder-url "$coder_url" "$@"
+fi
+case "$command" in
+  create|start|update) ;;
+  *) usage >&2; exit 2 ;;
+esac
+shift
+
+workspace=${1:-}
+[[ -n $workspace ]] || { printf 'workspace %s requires a workspace name\n' "$command" >&2; exit 2; }
+[[ $workspace =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+  printf 'invalid Coder workspace name: %s\n' "$workspace" >&2
+  exit 2
+}
+shift
+
+role=
+capability=
+size=
+template_version=
+expected_codex=
+update_mode=
+if [[ $command == start && $# -gt 0 ]]; then
+  printf 'unexpected workspace start argument: %s\n' "$1" >&2
+  exit 2
+fi
+while (( $# > 0 )); do
+  case "$1" in
+    --expect-codex)
+      [[ $command == update && $# -ge 2 && $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        echo '--expect-codex requires an exact stable version for update' >&2; exit 2;
+      }
+      expected_codex=$2
+      shift 2
+      ;;
+    --check|--restart)
+      [[ $command == update && -z $update_mode ]] || {
+        echo 'choose exactly one of --check or --restart for update' >&2; exit 2;
+      }
+      update_mode=$1
+      shift
+      ;;
+    --role)
+      (( $# >= 2 )) || { echo '--role requires a value' >&2; exit 2; }
+      role=$2
+      shift 2
+      ;;
+    --capability)
+      (( $# >= 2 )) || { echo '--capability requires a value' >&2; exit 2; }
+      capability=$2
+      shift 2
+      ;;
+    --size)
+      (( $# >= 2 )) || { echo '--size requires a value' >&2; exit 2; }
+      size=$2
+      shift 2
+      ;;
+    --template-version)
+      (( $# >= 2 )) || { echo '--template-version requires a name' >&2; exit 2; }
+      [[ -z $template_version && $2 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+        echo '--template-version must be one explicit version name' >&2
+        exit 2
+      }
+      template_version=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'unexpected workspace create argument: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ $command == update ]]; then
+  [[ -n $expected_codex && -n $update_mode && -z $role$capability$size$template_version ]] || {
+    echo 'update requires --expect-codex <version> and exactly one of --check or --restart' >&2
+    exit 2
+  }
+fi
+
+if [[ $command == create ]]; then
+  case "$role" in
+    development|runner) ;;
+    *) echo '--role must be development or runner' >&2; exit 2 ;;
+  esac
+  case "$capability" in
+    core|containers) ;;
+    *) echo '--capability must be core or containers' >&2; exit 2 ;;
+  esac
+  case "$size" in
+    small|standard|large|jetbrains|jetbrains-xl) ;;
+    *) echo '--size must be small, standard, large, jetbrains, or jetbrains-xl' >&2; exit 2 ;;
+  esac
+fi
+
+if [[ $(uname -s) != Darwin ]]; then
+  echo 'workspace creation currently supports the macOS operator client.' >&2
+  exit 1
+fi
+for required_command in coder mktemp; do
+  command -v "$required_command" >/dev/null 2>&1 || {
+    printf 'required local command is missing: %s\n' "$required_command" >&2
+    exit 1
+  }
+done
+
+coder_bin=$(command -v coder)
+config_root=${REMOTE_DEV_CODEX_DESKTOP_CONFIG_ROOT:-$HOME/Library/Application Support/remote-dev/coder}
+coder_config=$config_root/$profile
+coder_url_file=$coder_config/url
+
+if [[ $command == update ]]; then
+  [[ -f $coder_url_file && ! -L $coder_url_file && $(<"$coder_url_file") == "$coder_url" ]] || {
+    echo 'Authenticate this profile with codex-desktop before updating.' >&2; exit 1;
+  }
+  coder_command=("$coder_bin" --no-version-warning --global-config "$coder_config" --url "$coder_url")
+  probe='/usr/local/bin/remote-dev-workspace-role require development >/dev/null && /usr/local/bin/codex --version'
+  if ! before=$("${coder_command[@]}" ssh --disable-autostart=true --wait=no "$workspace" -- "$probe"); then
+    echo 'UPDATE_PREFLIGHT_FAILED: require a running development workspace and working transport; no update attempted.' >&2
+    exit 1
+  fi
+  printf 'Workspace  %s\nInstalled  %s\nExpected   codex-cli %s\n' "$workspace" "$before" "$expected_codex"
+  if [[ $update_mode == --check ]]; then
+    printf 'CHECKED    No changes made. Publish the approved image/template, then rerun with --restart.\n'
+    exit 0
+  fi
+  printf 'Updating the active template; workspace processes will be interrupted.\n'
+  if ! "${coder_command[@]}" update "$workspace" </dev/null; then
+    printf 'UPDATE_FAILED: inspect the Coder build log before retrying; no automatic rollback attempted.\n' >&2
+    exit 1
+  fi
+  if ! after=$("${coder_command[@]}" ssh --disable-autostart=true --wait=yes "$workspace" -- "$probe"); then
+    echo 'UPDATE_UNVERIFIED: inspect the build and agent logs; role/version verification failed.' >&2
+    exit 1
+  fi
+  if [[ $after != "codex-cli $expected_codex" ]]; then
+    printf 'CODEX_VERSION_MISMATCH: expected %s, got %s. Publish the correct image/template and retry.\n' "$expected_codex" "$after" >&2
+    exit 1
+  fi
+  printf 'READY      Workspace Codex version verified: %s\n' "$after"
+  printf 'Next       Reconnect %s.%s in Codex Desktop and reopen the model picker.\n' "$profile" "$workspace"
+  printf 'Recovery   If models are missing, inspect the remote model catalog and account access.\n'
+  exit 0
+fi
+
+umask 077
+mkdir -p "$coder_config"
+chmod 0700 "$coder_config"
+if [[ -L $coder_url_file || ( -e $coder_url_file && ! -f $coder_url_file ) ]]; then
+  printf 'refusing to replace a non-regular Coder URL file: %s\n' \
+    "$coder_url_file" >&2
+  exit 1
+fi
+coder_url_temp=$(mktemp "$coder_config/.url.XXXXXX")
+cleanup() {
+  rm -f -- "${coder_url_temp:-}"
+}
+trap cleanup EXIT
+printf '%s\n' "$coder_url" > "$coder_url_temp"
+chmod 0600 "$coder_url_temp"
+mv "$coder_url_temp" "$coder_url_file"
+coder_url_temp=
+trap - EXIT
+
+coder_command=("$coder_bin" --no-version-warning --global-config "$coder_config")
+if ! "${coder_command[@]}" --url "$coder_url" whoami >/dev/null 2>&1; then
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    cat >&2 <<EOF
+Coder login is required for $coder_url.
+Run this command from an interactive Terminal on the Mac and complete the
+browser sign-in; no deployment token will be copied to the Mac.
+EOF
+    exit 1
+  fi
+  printf 'Starting interactive Coder login for %s...\n' "$coder_url"
+  "${coder_command[@]}" login "$coder_url"
+fi
+if ! "${coder_command[@]}" --url "$coder_url" whoami >/dev/null; then
+  printf 'Coder login did not produce an authenticated session for %s.\n' \
+    "$coder_url" >&2
+  exit 1
+fi
+
+if [[ $command == start ]]; then
+  if ! "${coder_command[@]}" --url "$coder_url" start --yes "$workspace"; then
+    cat >&2 <<EOF
+Workspace start failed.
+Recovery: preserve the Coder build log, run
+  bin/remote-dev --profile $profile doctor
+and retry after repairing the reported deployment or workspace failure.
+EOF
+    exit 1
+  fi
+  role_output=
+  printf -v role_command ' %q' /usr/local/bin/remote-dev-workspace-role show
+  if ! role_output=$("${coder_command[@]}" --url "$coder_url" ssh \
+    --wait=yes "$workspace" -- "$role_command"); then
+    printf 'Workspace started, but its immutable role marker could not be verified.\n' >&2
+    exit 1
+  fi
+  role_output=${role_output%$'\n'}
+  case "$role_output" in
+    development) role=development ;;
+    runner) role=runner ;;
+    *)
+      printf 'WORKSPACE_ROLE_INVALID: %s\n' "$role_output" >&2
+      exit 1
+      ;;
+  esac
+  cat <<EOF
+READY      Coder workspace is running.
+Profile    $profile
+Coder URL  $coder_url
+Workspace  $workspace
+Role       $role
+EOF
+  exit 0
+fi
+
+create_command=("${coder_command[@]}" --url "$coder_url" create --template remote-dev-docker
+  --parameter "workspace_role=$role" --parameter "docker_capability=$capability" --parameter "workspace_size=$size")
+if [[ -n $template_version ]]; then
+  create_command+=(--template-version "$template_version" --automatic-updates never)
+fi
+if ! "${create_command[@]}" --yes "$workspace"; then
+  cat >&2 <<EOF
+Workspace creation failed.
+Recovery: preserve the Coder build log, run
+  bin/remote-dev --profile $profile doctor
+and retry after repairing the reported deployment or template failure.
+EOF
+  exit 1
+fi
+
+role_output=
+printf -v role_command ' %q' \
+  /usr/local/bin/remote-dev-workspace-role require "$role"
+if ! role_output=$("${coder_command[@]}" --url "$coder_url" ssh \
+  --wait=yes "$workspace" -- \
+  "$role_command" 2>&1); then
+  printf '%s\n' "$role_output" >&2
+  cat >&2 <<EOF
+Workspace was created, but its role marker could not be verified.
+Recovery: inspect the workspace build log. If Workspace role was absent, run
+  bin/remote-dev --profile $profile install
+and create a new workspace; do not reuse this persistent home under another role.
+EOF
+  exit 1
+fi
+role_output=${role_output%$'\n'}
+if [[ $role_output != *"workspace_role=$role"* ]]; then
+  printf 'WORKSPACE_ROLE_MISMATCH: expected %s, got %s\n' \
+    "$role" "$role_output" >&2
+  printf 'Recovery: delete no data automatically; create a new workspace with the required role.\n' >&2
+  exit 1
+fi
+
+cat <<EOF
+READY      Coder workspace is running.
+Profile    $profile
+Coder URL  $coder_url
+Workspace  $workspace
+Role       $role
+Capability $capability
+Size       $size
+EOF
+if [[ -n $template_version ]]; then
+  printf 'Template   %s (automatic updates disabled)\n' "$template_version"
+fi

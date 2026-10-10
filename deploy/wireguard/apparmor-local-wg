@@ -1,0 +1,2 @@
+# Remote Dev generates a root-owned setconf view under /run.
+/run/wireguard/** r,

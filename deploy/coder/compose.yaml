@@ -1,0 +1,69 @@
+name: remote-dev-coder
+
+services:
+  coder:
+    image: ghcr.io/coder/coder:v2.36.0@sha256:215e6d4c1260e213a283dbac9b669b7bd79f5dd25974d72ae18b45c565f062bb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${CODER_HOST_PORT:?set CODER_HOST_PORT}:7080"
+    environment:
+      CODER_HTTP_ADDRESS: "0.0.0.0:7080"
+      CODER_ACCESS_URL: "${CODER_ACCESS_URL}"
+      CODER_PG_CONNECTION_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database/${POSTGRES_DB}?sslmode=disable"
+      TF_CLI_CONFIG_FILE: "/home/coder/.terraformrc"
+      TF_VAR_remote_dev_egress_mtu: "${REMOTE_DEV_EGRESS_MTU}"
+    group_add:
+      - "${DOCKER_GID}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./terraformrc:/home/coder/.terraformrc:ro
+      - coder_home:/home/coder
+    networks:
+      default:
+      control:
+        aliases:
+          - coder-control
+    depends_on:
+      database:
+        condition: service_healthy
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 1024
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+
+  database:
+    image: postgres:17@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB}"
+    volumes:
+      - coder_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    shm_size: 128m
+    mem_limit: 1g
+    cpus: 1
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+
+volumes:
+  coder_home:
+  coder_data:
+
+networks:
+  control:
+    name: remote-dev-control
+    external: true
