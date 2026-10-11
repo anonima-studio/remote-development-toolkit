@@ -58,6 +58,9 @@ class OperationTests(unittest.TestCase):
         self.runner_root = self.homes["runner"] / "projects/fixture"
         self.source.mkdir()
         self.git(self.source, "init", "-q", "-b", "main")
+        # This fixture is copied with .git; keep background maintenance out of the snapshot.
+        self.git(self.source, "config", "maintenance.auto", "false")
+        self.git(self.source, "config", "gc.auto", "0")
         self.git(self.source, "config", "user.name", "Fixture")
         self.git(self.source, "config", "user.email", "fixture@example.invalid")
         (self.source / ".remote-dev").mkdir()

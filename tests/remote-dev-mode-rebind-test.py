@@ -111,6 +111,9 @@ class RebindTests(unittest.TestCase):
     def checkout(self, root, origin="https://example.invalid/fixture.git"):
         root.mkdir(parents=True)
         self.git(root, "init", "-q", "-b", "main")
+        # copytree needs a quiescent .git: auto-maintenance removes its lock asynchronously.
+        self.git(root, "config", "maintenance.auto", "false")
+        self.git(root, "config", "gc.auto", "0")
         self.git(root, "config", "user.name", "Fixture")
         self.git(root, "config", "user.email", "fixture@example.invalid")
         (root / ".remote-dev").mkdir()
