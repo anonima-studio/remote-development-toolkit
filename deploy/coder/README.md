@@ -3,7 +3,7 @@
 Coder Community and PostgreSQL run as one Docker Compose project,
 `remote-dev-coder`, on the server.
 
-- Coder is pinned to `v2.36.0` by image digest; PostgreSQL 17 is pinned by
+- Coder and PostgreSQL versions are defined only in [`compose.yaml`](compose.yaml), pinned by
   digest too. Upgrades are explicit repository changes followed by
   verification.
 - PostgreSQL is reachable only on the Compose network.

@@ -539,8 +539,8 @@ coder_host_port=$2
 egress_mtu=$3
 cd /opt/remote-dev/coder
 
-workspace_image_expected_hash=cf2a26a364ef23228b22b3cdcd2dc5012ca6f154fa0355542de9532fe60ea962
-workspace_image_tag=remote-dev-workspace:node24-20260906-cf2a26a364e
+workspace_image_expected_hash=44772a817ce025190a4e5a442a34c043d5ba0bdf3847f9616211683ff6e25e15
+workspace_image_tag=remote-dev-workspace:node24-20260906-44772a817ce
 workspace_image_hash=$(cat \
   /opt/remote-dev/templates/docker/Dockerfile \
   /opt/remote-dev/templates/docker/codex-start.sh \

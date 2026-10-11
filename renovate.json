@@ -1,0 +1,125 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "enabledManagers": [
+    "dockerfile",
+    "docker-compose",
+    "github-actions",
+    "npm",
+    "custom.regex"
+  ],
+  "timezone": "Etc/UTC",
+  "schedule": [
+    "* * 1 * *"
+  ],
+  "updateNotScheduled": false,
+  "automerge": false,
+  "separateMajorMinor": false,
+  "separateMinorPatch": false,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "schedule": [],
+    "minimumReleaseAge": "0 days",
+    "groupName": null,
+    "updateNotScheduled": true
+  },
+  "osvVulnerabilityAlerts": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^templates/docker/Dockerfile$/",
+        "/^templates/docker/codex-start\\.sh$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+ARG \\w+_VERSION=(?<currentValue>[^\\s]+)",
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+expected_codex_version='codex-cli (?<currentValue>[^']+)'"
+      ],
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchDatasources": [
+        "docker"
+      ],
+      "pinDigests": true
+    },
+    {
+      "matchPackageNames": [
+        "node",
+        "pnpm"
+      ],
+      "groupName": "Node toolchain"
+    },
+    {
+      "matchPackageNames": [
+        "node"
+      ],
+      "allowedVersions": ">=24 <25"
+    },
+    {
+      "matchPackageNames": [
+        "@openai/codex"
+      ],
+      "groupName": "Codex CLI"
+    },
+    {
+      "matchPackageNames": [
+        "oven/bun"
+      ],
+      "groupName": "Bun toolchain"
+    },
+    {
+      "matchPackageNames": [
+        "docker"
+      ],
+      "groupName": "Docker and Compose toolchain"
+    },
+    {
+      "matchPackageNames": [
+        "codercom/enterprise-base"
+      ],
+      "groupName": "Workspace base image"
+    },
+    {
+      "matchPackageNames": [
+        "ghcr.io/coder/coder"
+      ],
+      "groupName": "Coder control plane"
+    },
+    {
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "groupName": "PostgreSQL database"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchManagers": [
+        "npm"
+      ],
+      "matchDepTypes": [
+        "devDependencies",
+        "dependencies"
+      ],
+      "groupName": "Repository npm tooling"
+    }
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "* * 1 * *"
+    ]
+  },
+  "prBodyNotes": [
+    "If the workspace image inputs changed, run `pnpm image:hash`, commit the generated pins, and rerun `pnpm test`. Hosted Renovate does not run postUpgradeTasks here."
+  ]
+}

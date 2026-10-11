@@ -1,7 +1,8 @@
 # Docker workspace template
 
 The **Remote Dev Docker** Coder template (`remote-dev-docker`), derived from
-the Docker example shipped with Coder `v2.36.0`. It provisions one unprivileged
+the Docker example shipped with Coder (the deployment pin is in
+[`compose.yaml`](../../deploy/coder/compose.yaml)). It provisions one unprivileged
 container per workspace with a persistent Docker volume for `/home/coder`.
 `bin/remote-dev install` imports it whenever `main.tf` or this README changes.
 
@@ -67,9 +68,11 @@ egress MTU changes.
 ## Image
 
 The workspace image is built on the server from [`Dockerfile`](Dockerfile),
-assembled from digest-pinned upstream stages. It provides Node.js `24.18.1`,
-npm and Corepack, fallback pnpm `11.5.1`, Bun `1.3.14`, Codex CLI `0.147.0`,
-Docker Engine/CLI `29.7.2` and Docker Compose `5.4.0`. A project's
+assembled from digest-pinned upstream stages. The Dockerfile is the single
+source for Node.js, npm, Corepack, fallback pnpm, Bun, Codex CLI and the Docker
+Engine/CLI/Compose bundle. Bun comes from the Bun stage; Docker and Compose
+come together from the Docker stage, so Compose has no separate install pin.
+A project's
 `packageManager` stays authoritative through Corepack. Version changes are
 explicit image and template changes followed by clean and representative
 workspace checks.
@@ -80,6 +83,13 @@ rebuilds the exact tag when the local image was pruned. Every image still
 referenced by an existing workspace version is kept alive by a never-started
 retention container, so a stopped workspace can start again. `doctor` checks
 both.
+
+After editing any image input, run `pnpm image:hash` at the repository root.
+It prints the new hash prefix and updates the installer, Terraform tag and
+current test pins. `pnpm image:hash --check` and `pnpm test` reject stale pins
+without writing; recover by running `pnpm image:hash` and committing its changes.
+The input list and order come directly from `deploy/install.sh`. CI builds the
+image on Linux without pushing it. See the [update policy](../../SUPPORT.md#dependency-updates).
 
 ## In-workspace helpers
 

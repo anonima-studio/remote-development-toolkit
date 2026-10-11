@@ -381,7 +381,7 @@ resource "docker_volume" "docker_data" {
 resource "docker_container" "workspace" {
   count = data.coder_workspace.me.start_count
 
-  image    = "remote-dev-workspace:node24-20260906-cf2a26a364e"
+  image    = "remote-dev-workspace:node24-20260906-44772a817ce"
   name     = "coder-${data.coder_workspace_owner.me.name}-${lower(data.coder_workspace.me.name)}"
   hostname = data.coder_workspace.me.name
   runtime  = data.coder_parameter.docker_capability.value == "containers" ? "sysbox-runc" : "runc"

@@ -18,6 +18,7 @@ EOF
 check_only=false
 project_dir=.
 codex_bin=/usr/local/bin/codex
+# renovate: datasource=npm depName=@openai/codex
 expected_codex_version='codex-cli 0.147.0'
 while (( $# > 0 )); do
   case "$1" in

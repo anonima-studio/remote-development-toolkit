@@ -55,7 +55,7 @@ remote execution** («локальные агенты, удалённое исп
 | Развёртывание Coder, `install`, `doctor`, `status`, `audit` | stable | Smoke-тест CLI на синтетических профилях в CI; `doctor` на вашем хосте |
 | Запуск одной командой (`quickstart`, `init`) и минимальная топология | beta | Тесты топологий профиля и smoke-тест CLI в CI; серверная часть проверяется самим quickstart, который завершается `doctor` |
 | Расширенная топология (Cloudflare Tunnel + WireGuard) | beta | Тест сетевого контракта в CI; проверки `doctor` на вашем хосте |
-| Docker-шаблон workspace | stable | Тесты workspace, ролей и удержания образов в CI |
+| Docker-шаблон workspace | stable | Сборка образа на Linux, проверка hash, тесты workspace, ролей и удержания образов в CI |
 | Режим `remote` с адаптером Codex (необязательным) | stable | Smoke-тесты Codex и Codex Desktop в CI |
 | `preview`, `debug-forward`, `project-setup`, `worktree-vars` | stable | Smoke-тесты в CI |
 | Передача секретов по манифестам | beta | Тесты на синтетических данных в CI |
@@ -122,3 +122,37 @@ Remote development toolkit by Anonima Studio. Copyright 2026 Yury Telitsin.
 Предоставляется «как есть», без SLA. Issues приветствуются; pull requests
 рассматриваются на усмотрение автора. Об уязвимостях сообщайте приватно:
 [SECURITY.md](../../SECURITY.md).
+
+Плановые обновления зависимостей — ежемесячно, в первый день месяца по UTC;
+исправления безопасности — сразу. Renovate создаёт отдельный PR на семейство
+компонентов; автор проверяет CI и принимает изменения. CI сохраняет проверки
+macOS и gitleaks, собирает workspace image на Linux без публикации и проверяет
+Coder Compose с примером окружения.
+
+Pins фиксируют содержимое upstream-образов через digest, версии устанавливаемых
+пакетов и дерево npm через lockfile. Hash исходников связывает Dockerfile и
+helpers с tag шаблона. Это делает обновления явными и проверяемыми, но не
+гарантирует отсутствие уязвимостей или неизменность apt-пакетов из Ubuntu.
+Текущие версии указаны в
+[`templates/docker/Dockerfile`](../../templates/docker/Dockerfile) и
+[`deploy/coder/compose.yaml`](../../deploy/coder/compose.yaml).
+
+Версию Codex можно выбрать отдельно для workspace (подставьте явную версию,
+профиль и workspace):
+
+```bash
+bin/remote-dev --profile example-profile codex-update my-app --version <version> --check
+bin/remote-dev --profile example-profile codex-update my-app --version <version> --restart
+```
+
+Проверка показывает текущую и целевую версии и требования. `--restart` печатает
+receipt, перезапускает workspace и проверяет установленную версию. Другие workspace и pin образа не
+меняются. Завершите активные сессии перед `--restart`; используйте его, когда допустим
+перезапуск. Если мешает требование или существующий receipt, следуйте руководству
+по восстановлению перед повтором. Повторите `--check` после обновления.
+Восстановление: [workspace-updates.md](../workspace-updates.md).
+
+После изменения входных файлов образа запустите `pnpm image:hash` в корне
+репозитория и закоммитьте изменённые pins. `pnpm image:hash --check` и `pnpm test`
+отклоняют устаревший hash и показывают команду исправления. Полная
+[политика обновлений](../../SUPPORT.md#dependency-updates).

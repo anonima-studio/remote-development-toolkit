@@ -54,7 +54,7 @@ Released as portfolio and product, as is. Maturity levels:
 | Coder deployment, `install`, `doctor`, `status`, `audit` | stable | CLI smoke test with synthetic profiles in CI; `doctor` on your host after quickstart |
 | One-command start (`quickstart`, `init`) and minimal topology (`ssh-forward` + `host`) | beta | Profile topology and CLI smoke tests in CI (`init`, validation, SSH forward); the server part is verified by running the quickstart, which ends with `doctor` |
 | Advanced topology (Cloudflare Tunnel + WireGuard egress) | beta | Network contract smoke test in CI; `doctor` checks tunnel, handshake, policy route and fail-closed route on your host |
-| Docker workspace template (`core`/`containers`, roles, sizes, PID caps) | stable | Workspace, role and image-retention tests in CI; `doctor` image checks |
+| Docker workspace template (`core`/`containers`, roles, sizes, PID caps) | stable | Linux image build, source hash, workspace, role and image-retention tests in CI; `doctor` image checks |
 | `remote` mode with Codex Desktop / Codex CLI adapter (optional) | stable | Codex and Codex Desktop smoke tests in CI |
 | `preview`, `debug-forward`, `project-setup`, `worktree-vars` | stable | Preview, project-setup and worktree-vars smoke tests in CI |
 | Secret transfer manifests (`secrets plan/apply/verify`) | beta | Secret upload, read and binding tests in CI (synthetic payloads) |
@@ -66,7 +66,8 @@ Released as portfolio and product, as is. Maturity levels:
 | Off-host backup (`backup/`) | prototype | Shell lint only; restore has not been rehearsed as part of this release |
 
 CI runs `pnpm lint` and `pnpm test` on macOS (the client platform) for every
-push and pull request, plus a secret scan. See
+push and pull request, plus a Linux workspace image build, Coder Compose
+validation with a sample environment and a secret scan. See
 [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ## Quickstart
@@ -175,3 +176,11 @@ installs or pins keep their own licenses; see [THIRD_PARTY.md](THIRD_PARTY.md).
 Provided as is, without an SLA. Issues are welcome; pull requests are reviewed
 at the maintainer's discretion. See [SUPPORT.md](SUPPORT.md) and report
 vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
+Routine dependency updates are scheduled monthly; security fixes are handled
+immediately. Immutable image digests, explicit package pins and the lockfile
+make updates deliberate and reviewable. Current versions are defined in
+[`templates/docker/Dockerfile`](templates/docker/Dockerfile) and
+[`deploy/coder/compose.yaml`](deploy/coder/compose.yaml). Pick an explicit Codex
+version per workspace with `codex-update --version <version>`; see the complete
+[update policy and commands](SUPPORT.md#dependency-updates).

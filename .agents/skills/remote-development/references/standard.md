@@ -96,7 +96,8 @@ resolve on the daemon host.
 Resolve tool versions in this order:
 
 1. An explicit project pin.
-2. The exact toolkit default below.
+2. The exact toolkit default in
+   [`templates/docker/Dockerfile`](../../../../templates/docker/Dockerfile).
 3. An explicit unresolved exception.
 
 Never fetch a floating `latest` during ordinary workspace startup. Update
@@ -111,9 +112,9 @@ workspace Node override.
 
 | Capability | Default | Project override |
 | --- | --- | --- |
-| Node.js | `24.18.1` | `.mise.toml`, `.tool-versions`, `.node-version`, or an equivalent explicit pin |
-| pnpm | `11.5.1` fallback through Corepack | exact `packageManager` in `package.json` |
-| Bun | `1.3.14` | project mise/tool pin |
+| Node.js | digest-pinned Node stage in the Dockerfile | `.mise.toml`, `.tool-versions`, `.node-version`, or an equivalent explicit pin |
+| pnpm | exact fallback pin in the Dockerfile, through Corepack | exact `packageManager` in `package.json` |
+| Bun | digest-pinned Bun stage in the Dockerfile | project mise/tool pin |
 | Codex CLI | exact version pinned by the toolkit image | none unless the project documents a compatibility exception |
 | Docker CLI | exact version pinned by the toolkit image | no ordinary project override |
 | Docker Compose | exact plugin version pinned by the toolkit image | no ordinary project override |

@@ -120,9 +120,9 @@ pinned_output=$(env \
   "$repo_root/bin/remote-dev" --profile example-profile \
   workspace create example-app-runner \
   --role runner --capability containers --size standard \
-  --template-version mode-pilot-cf2a26a364e)
-[[ $pinned_output == *'Template   mode-pilot-cf2a26a364e (automatic updates disabled)'* ]]
-grep -Fq -- '--template-version mode-pilot-cf2a26a364e --automatic-updates never' "$command_log"
+  --template-version mode-test-version)
+[[ $pinned_output == *'Template   mode-test-version (automatic updates disabled)'* ]]
+grep -Fq -- '--template-version mode-test-version --automatic-updates never' "$command_log"
 
 : > "$command_log"
 start_output=$(env \

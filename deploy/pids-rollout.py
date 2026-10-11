@@ -14,7 +14,13 @@ import time
 import urllib.request
 from pathlib import Path
 
-POLICY_NORMALIZED_SHA256 = "9aa4ae776e0b6716218bbaad85c54a6002aa7679bc3e79b966f8683a06fd0edb"
+# Reviewed template includes the exec-completion gate and local Coder origin.
+# The public export changes only the branch-sync skill paths in this template.
+# Keep these pins manual: dependency image changes are normalized out below.
+REVIEWED_POLICY_SHA256 = frozenset({
+    "cabf739bc824549e914884068a11a5e5571a39dacd59130ab02bf4a4008da722",  # private
+    "a3a0562f2b7e9043c1b0ad0d2f8d9d117352032ecc906879f6b9f600e734be7a",  # public
+})
 RECORD_ROOT = Path("/opt/remote-dev/coder/pids-rollouts")
 IMAGE_PATTERN = r'(resource "docker_container" "workspace"\s*\{\s*count\s*=\s*[^\n]+\n\s*image\s*=\s*)"[^"\n]+"'
 
@@ -156,7 +162,7 @@ class Rollout:
             raise ValueError("Active template version is not ready")
         base = source_from_archive(self.api("files/" + active["job"]["file_id"], raw=True))
         normalized = policy_for_image(base, "remote-dev-workspace:policy-reference")
-        if hashlib.sha256(normalized.encode()).hexdigest() != POLICY_NORMALIZED_SHA256:
+        if hashlib.sha256(normalized.encode()).hexdigest() not in REVIEWED_POLICY_SHA256:
             raise ValueError("Active PID policy differs from the reviewed source")
         source = policy_for_image(base, image)
         digest = hashlib.sha256(source.encode()).hexdigest()

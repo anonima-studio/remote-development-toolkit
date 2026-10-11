@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7 AS node_toolchain
-FROM oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS bun_toolchain
-FROM docker@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07 AS docker_toolchain
+FROM node:24@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7 AS node_toolchain
+# Bun is copied from this stage; Renovate updates its digest.
+FROM oven/bun:1@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS bun_toolchain
+# Docker Engine, CLI and Compose are copied together from this stage.
+FROM docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07 AS docker_toolchain
 
 FROM codercom/enterprise-base:ubuntu@sha256:93e359e99a6fdaf6b11e3394fe77b0833bf3b6615b89737665aae1ed20abdb33
 
@@ -10,6 +12,11 @@ ARG REMOTE_DEV_WORKSPACE_SOURCE_SHA256
 LABEL id0.remote-dev.workspace-source-sha256="$REMOTE_DEV_WORKSPACE_SOURCE_SHA256"
 
 USER root
+
+# renovate: datasource=npm depName=pnpm
+ARG PNPM_VERSION=11.5.1
+# renovate: datasource=npm depName=@openai/codex
+ARG CODEX_VERSION=0.147.0
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -28,9 +35,9 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
   && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
   && ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
   && corepack enable --install-directory /usr/local/bin pnpm \
-  && COREPACK_HOME=/usr/local/share/corepack corepack install --global pnpm@11.5.1 \
+  && COREPACK_HOME=/usr/local/share/corepack corepack install --global pnpm@${PNPM_VERSION} \
   && test -x /usr/local/bin/pnpx \
-  && npm install --global @openai/codex@0.147.0 \
+  && npm install --global @openai/codex@${CODEX_VERSION} \
   && npm cache clean --force
 
 COPY --from=bun_toolchain /usr/local/bin/bun /usr/local/bin/bun

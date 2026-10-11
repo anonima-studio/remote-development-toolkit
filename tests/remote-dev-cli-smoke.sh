@@ -5,8 +5,8 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Synthetic host profiles; tests never read the deployment profiles.
 export REMOTE_DEV_PROFILE_DIR="$repo_root/tests/fixtures/host-profiles"
 help_output=$($repo_root/bin/remote-dev --help)
-workspace_image_hash=cf2a26a364ef23228b22b3cdcd2dc5012ca6f154fa0355542de9532fe60ea962
-workspace_image_tag=remote-dev-workspace:node24-20260906-cf2a26a364e
+workspace_image_hash=44772a817ce025190a4e5a442a34c043d5ba0bdf3847f9616211683ff6e25e15
+workspace_image_tag=remote-dev-workspace:node24-20260906-44772a817ce
 
 for marker in 'Usage: remote-dev [--profile <name>] <command>' init quickstart profile install doctor status audit codex workspace local-agent worktree-vars credentials forward \
   'There is no' 'Keep the Coder dashboard forwarded to this Mac over SSH'; do
@@ -16,29 +16,7 @@ for marker in 'Usage: remote-dev [--profile <name>] <command>' init quickstart p
   fi
 done
 
-calculated_workspace_image_hash=$(node -e '
-const crypto = require("node:crypto");
-const fs = require("node:fs");
-const hash = crypto.createHash("sha256");
-for (const file of process.argv.slice(1)) hash.update(fs.readFileSync(file));
-process.stdout.write(hash.digest("hex"));
-' \
-  "$repo_root/templates/docker/Dockerfile" \
-  "$repo_root/templates/docker/codex-start.sh" \
-  "$repo_root/templates/docker/project-setup.sh" \
-  "$repo_root/templates/docker/project-contract.py" \
-  "$repo_root/templates/docker/mode-guard.py" \
-  "$repo_root/templates/docker/worktree-vars.sh" \
-  "$repo_root/templates/docker/workspace-role.sh" \
-  "$repo_root/templates/docker/managed-unlink.py" \
-  "$repo_root/templates/docker/skills/worktree-branch-sync/SKILL.md" \
-  "$repo_root/templates/docker/skills/worktree-branch-sync/references/worktree-branch-sync.md" \
-  "$repo_root/templates/docker/start-docker.sh")
-if [[ $calculated_workspace_image_hash != "$workspace_image_hash" ]]; then
-  printf 'workspace image hash mismatch: expected %s, got %s\n' \
-    "$workspace_image_hash" "$calculated_workspace_image_hash" >&2
-  exit 1
-fi
+python3 -B "$repo_root/bin/remote-dev-image-hash.py" --check
 for invariant in \
   "$repo_root/deploy/install.sh:workspace_image_expected_hash=$workspace_image_hash" \
   "$repo_root/deploy/install.sh:workspace_image_tag=$workspace_image_tag" \

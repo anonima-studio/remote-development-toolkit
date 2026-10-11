@@ -21,13 +21,13 @@ informational and is **not legal advice**.
 
 | Component | Version or source | How it is used | License |
 | --- | --- | --- | --- |
-| [Coder](https://github.com/coder/coder) | `v2.36.0`, image pinned by digest | Workspace control plane, pulled from `ghcr.io/coder/coder` | AGPL-3.0 for the open-source code; code under its `enterprise/` directory is under Coder's separate enterprise license. Only Community features are used |
+| [Coder](https://github.com/coder/coder) | [`compose.yaml`](deploy/coder/compose.yaml), image pinned by digest | Workspace control plane, pulled from `ghcr.io/coder/coder` | AGPL-3.0 for the open-source code; code under its `enterprise/` directory is under Coder's separate enterprise license. Only Community features are used |
 | Terraform (inside the Coder image) | Version chosen by Coder | Coder's built-in provisioner | HashiCorp/IBM Business Source License 1.1 for Terraform 1.6.0 and later; earlier versions MPL-2.0 |
-| [Terraform provider `coder/coder`](https://github.com/coder/terraform-provider-coder) | `2.18.0` | Workspace template | MPL-2.0 |
-| [Terraform provider `kreuzwerker/docker`](https://github.com/kreuzwerker/terraform-provider-docker) | `4.5.0` | Workspace template | MPL-2.0 |
-| [PostgreSQL](https://www.postgresql.org/about/licence/) | 17, official `postgres` image pinned by digest | Coder database | PostgreSQL License; image packaging ([docker-library/postgres](https://github.com/docker-library/postgres)) MIT |
+| [Terraform provider `coder/coder`](https://github.com/coder/terraform-provider-coder) | [`main.tf`](templates/docker/main.tf) | Workspace template | MPL-2.0 |
+| [Terraform provider `kreuzwerker/docker`](https://github.com/kreuzwerker/terraform-provider-docker) | [`main.tf`](templates/docker/main.tf) | Workspace template | MPL-2.0 |
+| [PostgreSQL](https://www.postgresql.org/about/licence/) | [`compose.yaml`](deploy/coder/compose.yaml), official image pinned by digest | Coder database | PostgreSQL License; image packaging ([docker-library/postgres](https://github.com/docker-library/postgres)) MIT |
 | [Docker Engine, CLI, containerd, runc, Buildx, Compose](https://github.com/moby/moby) | Docker's Ubuntu repository (`docker-ce` and plugins) | Host container runtime | Apache-2.0 |
-| [Sysbox CE](https://github.com/nestybox/sysbox) | `0.7.1`, checksum-pinned `.deb` | Runtime for `containers` workspaces (`sysbox-install`) | Apache-2.0 |
+| [Sysbox CE](https://github.com/nestybox/sysbox) | [`install.sh`](deploy/sysbox/install.sh), checksum-pinned `.deb` | Runtime for `containers` workspaces (`sysbox-install`) | Apache-2.0 |
 | [cloudflared](https://github.com/cloudflare/cloudflared) | Cloudflare's package repository | Optional `cloudflare-tunnel` ingress | Apache-2.0 |
 | [wireguard-tools](https://git.zx2c4.com/wireguard-tools/) | Ubuntu package | Optional `wireguard` egress | GPL-2.0 |
 | [restic](https://github.com/restic/restic) | Ubuntu package | Backup | BSD-2-Clause |
@@ -38,13 +38,13 @@ informational and is **not legal advice**.
 | Component | Version | License |
 | --- | --- | --- |
 | [`codercom/enterprise-base:ubuntu`](https://github.com/coder/images) | Pinned by digest | Image definitions MIT; the Ubuntu packages inside keep their own licenses |
-| [Node.js](https://github.com/nodejs/node) (from the official `node` image) | `24.18.1` | Node.js license (MIT) plus the licenses of its bundled dependencies; image packaging ([nodejs/docker-node](https://github.com/nodejs/docker-node)) MIT |
+| [Node.js](https://github.com/nodejs/node) (from the official `node` image) | [`Dockerfile`](templates/docker/Dockerfile), digest-pinned Node stage | Node.js license (MIT) plus the licenses of its bundled dependencies; image packaging ([nodejs/docker-node](https://github.com/nodejs/docker-node)) MIT |
 | [npm](https://github.com/npm/cli) | Bundled with Node.js | Artistic-2.0 |
 | [Corepack](https://github.com/nodejs/corepack) | Bundled with Node.js | MIT |
-| [pnpm](https://github.com/pnpm/pnpm) | `11.5.1` fallback | MIT |
-| [Bun](https://github.com/oven-sh/bun) (from the official `oven/bun` image) | `1.3.14` | MIT; statically links JavaScriptCore/WebKit under LGPL-2 and other libraries listed in Bun's license file |
-| [Codex CLI](https://github.com/openai/codex) (`@openai/codex`) | `0.147.0`, or the version set by `codex-update` | Apache-2.0. Using Codex also requires an OpenAI account under OpenAI's terms |
-| Docker Engine, CLI, containerd, runc, Compose plugin (from the official [`docker`](https://github.com/docker-library/docker) image) | Docker `29.7.2`, Compose `5.4.0` | Apache-2.0 |
+| [pnpm](https://github.com/pnpm/pnpm) | [`Dockerfile`](templates/docker/Dockerfile), fallback pin | MIT |
+| [Bun](https://github.com/oven-sh/bun) (from the official `oven/bun` image) | [`Dockerfile`](templates/docker/Dockerfile), digest-pinned Bun stage | MIT; statically links JavaScriptCore/WebKit under LGPL-2 and other libraries listed in Bun's license file |
+| [Codex CLI](https://github.com/openai/codex) (`@openai/codex`) | [`Dockerfile`](templates/docker/Dockerfile), or the workspace pin selected with `codex-update` | Apache-2.0. Using Codex also requires an OpenAI account under OpenAI's terms |
+| Docker Engine, CLI, containerd, runc, Compose plugin (from the official [`docker`](https://github.com/docker-library/docker) image) | [`Dockerfile`](templates/docker/Dockerfile), digest-pinned Docker stage (includes Compose) | Apache-2.0 |
 | Ubuntu packages (`git`, `curl`, `iproute2`, `iptables`, `python3-minimal`, `xz-utils`) | Ubuntu archive | Various free licenses, per package |
 
 ## Mac client
@@ -64,7 +64,10 @@ you to install them.
 
 The only development dependency is
 [`markdownlint-cli2`](https://github.com/DavidAnson/markdownlint-cli2)
-`0.23.2` (MIT). Its locked dependency tree contains 86 packages:
+(MIT); its version is defined in
+[`configs/markdownlint/package.json`](configs/markdownlint/package.json) and
+[`pnpm-lock.yaml`](pnpm-lock.yaml). The license inventory at publication contained
+86 packages; review it when the lockfile changes:
 
 | License | Packages |
 | --- | ---: |

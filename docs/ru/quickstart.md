@@ -25,7 +25,8 @@
 | Mutagen ровно 0.18.1 | только режим `local-agent` | `brew install mutagen-io/mutagen/mutagen` |
 | Codex Desktop или Codex CLI | только необязательный адаптер Codex | от OpenAI |
 
-Версия Coder CLI должна быть близка к серверной (Coder `v2.36.0`), иначе SSH
+Версия Coder CLI должна быть близка к серверной: её pin указан в
+[`deploy/coder/compose.yaml`](../../deploy/coder/compose.yaml), иначе SSH
 сообщит о несовместимости клиента и сервера.
 
 ### Сервер

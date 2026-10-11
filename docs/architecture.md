@@ -278,11 +278,12 @@ The reproducible unit is this repository plus secrets kept outside Git:
 - `bootstrap/ubuntu.sh`: host baseline;
 - `deploy/install.sh`: idempotent deployment, owner, session, template and
   schedule; repeating it with unchanged inputs changes nothing;
-- `deploy/coder/compose.yaml`: digest-pinned Coder `v2.36.0` and PostgreSQL 17
-  with resource limits;
-- `templates/docker/main.tf`: exact provider versions (`coder/coder 2.18.0`,
-  `kreuzwerker/docker 4.5.0`) and workspace policy;
-- `templates/docker/Dockerfile`: digest-pinned toolchain stages;
+- [`deploy/coder/compose.yaml`](../deploy/coder/compose.yaml): the single source
+  for digest-pinned Coder and PostgreSQL versions, with resource limits;
+- [`templates/docker/main.tf`](../templates/docker/main.tf): exact provider
+  versions and workspace policy;
+- [`templates/docker/Dockerfile`](../templates/docker/Dockerfile): the single
+  source for digest-pinned toolchain stages and installed package versions;
 - `backup/`: restic script and systemd units.
 
 When the public Terraform registry is unreachable from the server, a profile

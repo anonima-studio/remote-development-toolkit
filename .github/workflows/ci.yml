@@ -36,6 +36,37 @@ jobs:
       - name: Test
         run: pnpm test < /dev/null
 
+  workspace-image:
+    name: Build workspace image and validate Coder Compose
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.1
+
+      - name: Check workspace image pins
+        run: python3 -B bin/remote-dev-image-hash.py --check
+
+      - name: Validate Coder Compose with a sample environment
+        run: |
+          sample_env=$(mktemp)
+          trap 'rm -f "$sample_env"' EXIT
+          cat > "$sample_env" <<'ENV'
+          CODER_HOST_PORT=3080
+          CODER_ACCESS_URL=http://127.0.0.1:3080
+          REMOTE_DEV_EGRESS_MTU=1500
+          DOCKER_GID=999
+          POSTGRES_USER=coder
+          POSTGRES_PASSWORD=ci-placeholder-not-a-secret
+          POSTGRES_DB=coder
+          ENV
+          docker compose --env-file "$sample_env" -f deploy/coder/compose.yaml config --quiet
+
+      - name: Build workspace image (no push)
+        run: |
+          source_hash=$(sed -n 's/^workspace_image_expected_hash=//p' deploy/install.sh)
+          docker build --build-arg REMOTE_DEV_WORKSPACE_SOURCE_SHA256="$source_hash" templates/docker
+
   secret-scan:
     name: Secret scan
     runs-on: ubuntu-latest

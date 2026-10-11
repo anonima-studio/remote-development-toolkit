@@ -2,6 +2,11 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+codex_version=$(sed -n 's/^ARG CODEX_VERSION=//p' "$repo_root/templates/docker/Dockerfile")
+[[ -n $codex_version ]]
+export REMOTE_DEV_CODEX_IMAGE_VERSION="codex-cli $codex_version"
+grep -Fxq "expected_codex_version='$REMOTE_DEV_CODEX_IMAGE_VERSION'" \
+  "$repo_root/templates/docker/codex-start.sh"
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
@@ -30,7 +35,7 @@ printf '%s\n' \
   'set -euo pipefail' \
   'case "${1:-}" in' \
   '  --version)' \
-  '    echo "${REMOTE_DEV_CODEX_TEST_VERSION:-codex-cli 0.147.0}"' \
+  '    echo "${REMOTE_DEV_CODEX_TEST_VERSION:-$REMOTE_DEV_CODEX_IMAGE_VERSION}"' \
   '    exit 0' \
   '    ;;' \
   '  login)' \
@@ -86,7 +91,7 @@ check_output=$(env "${common_env[@]}" \
   "$test_helper" \
   --check --project-dir example-app)
 assert_contains "$check_output" "codex_path=$fake_bin/codex"
-assert_contains "$check_output" 'codex_version=codex-cli 0.147.0'
+assert_contains "$check_output" "codex_version=$REMOTE_DEV_CODEX_IMAGE_VERSION"
 assert_contains "$check_output" 'codex_auth=required'
 assert_contains "$check_output" "project_dir=$test_home/projects/example-app"
 assert_contains "$check_output" "worktree_root=$test_home/projects/.codex-worktrees"
@@ -154,7 +159,7 @@ fi
 
 grep -Fxq 'codex_bin=/usr/local/bin/codex' \
   "$repo_root/templates/docker/codex-start.sh"
-grep -Fq 'npm install --global @openai/codex@0.147.0' \
+grep -Fq 'npm install --global @openai/codex@${CODEX_VERSION}' \
   "$repo_root/templates/docker/Dockerfile"
 
 echo 'remote-dev Codex smoke passed'

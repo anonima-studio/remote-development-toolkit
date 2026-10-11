@@ -23,7 +23,8 @@ The client is macOS. The scripts run with the system Bash 3.2.
 | Mutagen 0.18.1 exactly | `local-agent` mode only | `brew install mutagen-io/mutagen/mutagen` |
 | Codex Desktop or Codex CLI | optional Codex adapter only | from OpenAI |
 
-Keep the Coder CLI close to the server version (Coder `v2.36.0`); SSH reports a
+Keep the Coder CLI close to the server pin in
+[`deploy/coder/compose.yaml`](../deploy/coder/compose.yaml); SSH reports a
 client/server version problem otherwise.
 
 ### Server
